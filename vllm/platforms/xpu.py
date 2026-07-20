@@ -93,6 +93,12 @@ def get_mem_info_wrapper(
 
     # Call the underlying C++ implementation
     free, total = torch.ops._C_cache_ops.getMemoryInfo(device)
+    if free == 0:
+        logger.warning_once(
+            "XPU device {device} reports 0 free memory. "
+            "Falling back to torch.xpu.mem_get_info() for total memory."
+        )
+        free, total = torch.xpu.mem_get_info(device)
 
     return free, total
 
