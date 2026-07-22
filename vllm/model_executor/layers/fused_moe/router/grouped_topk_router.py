@@ -25,6 +25,38 @@ from vllm.model_executor.utils import maybe_disable_graph_partition
 from vllm.platforms import current_platform
 
 
+def _xpu_topk_broken() -> bool:
+    """Whether to route MoE gating topk through a sort-based fallback.
+
+    torch.topk returns wrong values on some XPU (PVC) driver/IGC stacks
+    (intel/torch-xpu-ops#3777), which silently corrupts MoE expert selection
+    (every token routed to the wrong experts). torch.sort is unaffected on the
+    same stack, so we compute topk via a descending sort on XPU. Controlled by
+    VLLM_XPU_TOPK_SORT_WORKAROUND: "1"/unset -> on for XPU, "0" -> off.
+    """
+    import os
+
+    val = os.environ.get("VLLM_XPU_TOPK_SORT_WORKAROUND")
+    if val is not None:
+        return val == "1"
+    return current_platform.is_xpu()
+
+
+def _safe_topk(
+    x: torch.Tensor, k: int, dim: int = -1, sorted: bool = True
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """topk that avoids the broken XPU torch.topk (see _xpu_topk_broken).
+
+    Returns (values, indices) of the k largest elements along ``dim``. Uses a
+    descending sort (correct on XPU) as a drop-in for torch.topk. Order matches
+    torch.topk(sorted=True); for expert routing the selected set is what matters.
+    """
+    if _xpu_topk_broken():
+        vals, idx = torch.sort(x, dim=dim, descending=True, stable=True)
+        return vals.narrow(dim, 0, k), idx.narrow(dim, 0, k)
+    return torch.topk(x, k=k, dim=dim, sorted=sorted)
+
+
 def fused_grouped_topk(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -123,7 +155,9 @@ def grouped_topk(
         original_scores = scores
         scores = scores + e_score_correction_bias.unsqueeze(0)
         group_scores = (
-            scores.view(num_token, num_expert_group, -1).topk(2, dim=-1)[0].sum(dim=-1)
+            _safe_topk(scores.view(num_token, num_expert_group, -1), 2, dim=-1)[0].sum(
+                dim=-1
+            )
         )
     else:
         group_scores = (
@@ -132,7 +166,7 @@ def grouped_topk(
 
     # For batch invariance, use sorted=True to ensure deterministic expert selection
     use_sorted = envs.VLLM_BATCH_INVARIANT
-    group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=use_sorted)[
+    group_idx = _safe_topk(group_scores, k=topk_group, dim=-1, sorted=use_sorted)[
         1
     ]  # [n, top_k_group]
     group_mask = torch.zeros_like(group_scores)  # [n, n_group]
@@ -145,11 +179,11 @@ def grouped_topk(
     tmp_scores = scores.masked_fill(~score_mask.bool(), float("-inf"))  # [n, e]
 
     if e_score_correction_bias is not None:
-        topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=use_sorted)[1]
+        topk_ids = _safe_topk(tmp_scores, k=topk, dim=-1, sorted=use_sorted)[1]
         # Use original unbiased scores for the routing weights
         topk_weights = original_scores.gather(1, topk_ids)
     else:
-        topk_weights, topk_ids = torch.topk(
+        topk_weights, topk_ids = _safe_topk(
             tmp_scores, k=topk, dim=-1, sorted=use_sorted
         )
 
