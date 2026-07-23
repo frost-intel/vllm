@@ -968,7 +968,12 @@ class xpu_ops:
             "when block_table is disabled, cu_seqlens_k is needed"
         )
         if out is None:
-            out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+            # For MLA decode V may have a different head dim than Q 
+            # e.g. Q is [kv_lora_rank + rope] but V is [kv_lora_rank].
+            # The output head dim follows V, not Q. For standard attention this is a no-op.
+            out = torch.empty(
+                (*q.shape[:-1], v.shape[-1]), dtype=q.dtype, device=q.device
+            )
         real_window_size: tuple[int, int]
         if window_size is None:
             real_window_size = (-1, -1)
