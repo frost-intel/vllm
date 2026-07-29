@@ -5,6 +5,7 @@ from collections.abc import Sequence
 
 import torch
 
+import vllm.envs as envs
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8DynamicTensorSym,
     kFp8DynamicTokenSym,
@@ -265,6 +266,11 @@ class XPUFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             0, 2, 1
         )  # [G, K, N_per_group]
 
+    def __init__(self, config: FP8ScaledMMLinearLayerConfig) -> None:
+        super().__init__(config)
+        # When the fused w8a16 path is enabled, keep activations in bf16
+        self.apply_input_quant = not envs.VLLM_XPU_W8A16_BLOCK_FP8
+
     def apply_block_scaled_mm(
         self,
         A: torch.Tensor,
@@ -275,12 +281,25 @@ class XPUFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         # B is [N, K]; .t() gives [K, N] view (no copy).
         # Bs is stored as [n_blocks, k_blocks] view; .t() recovers the
         # contiguous [k_blocks, n_blocks] buffer that oneDNN expects.
-        output = torch.ops._xpu_C.fp8_gemm(
-            A,
-            B.t(),
-            self.config.out_dtype,
-            As,
-            Bs.t(),
-            torch.Tensor(),
-        )
+        if self.apply_input_quant:
+            output = torch.ops._xpu_C.fp8_gemm(
+                A,
+                B.t(),
+                self.config.out_dtype,
+                As,
+                Bs.t(),
+                torch.Tensor(),
+            )
+        else:
+            # Fused w8a16 path: activations stay bf16 (As is an unused
+            # placeholder). fp8_gemm_w8a16 dequantizes the fp8 weight blocks in
+            # its prologue and multiplies by the bf16 activations. It derives the
+            # block group size from k / Bs.size(0), so it needs the same
+            # [k_blocks, n_blocks] buffer the w8a8 path passes.
+            output = torch.ops._xpu_C.fp8_gemm_w8a16(
+                A,
+                B.t(),
+                Bs.t(),
+                torch.Tensor(),
+            )
         return output[..., : self._output_size]

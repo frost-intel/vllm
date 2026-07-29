@@ -295,6 +295,7 @@ if TYPE_CHECKING:
     VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
+    VLLM_XPU_W8A16_BLOCK_FP8: bool = True
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
@@ -2021,6 +2022,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # whether use xpu specific sample kernel
     "VLLM_XPU_USE_SAMPLER_KERNEL": lambda: bool(
         int(os.getenv("VLLM_XPU_USE_SAMPLER_KERNEL", "1"))
+    ),
+    # Route XPU block-scaled FP8 dense linear through the fused w8a16 GEMM
+    "VLLM_XPU_W8A16_BLOCK_FP8": lambda: bool(
+        int(os.getenv("VLLM_XPU_W8A16_BLOCK_FP8", "0"))
     ),
     # Enable simple KV offload.
     "VLLM_USE_SIMPLE_KV_OFFLOAD": lambda: bool(
