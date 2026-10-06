@@ -2,12 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
 import os
+import time
 
 import torch
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.profiler.wrapper import TorchProfilerWrapper
 from vllm.utils.mem_utils import MemorySnapshot, format_gib
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
@@ -15,11 +17,48 @@ from vllm.v1.worker.xpu_model_runner import (
     XPUMMEncoderModelRunner,
     XPUModelRunner,
     XPUModelRunnerV2,
+    begin_xpu_graph_profiling,
+    end_xpu_graph_profiling,
 )
 
 from .utils import request_memory
 
 logger = init_logger(__name__)
+
+
+class XPUTorchProfilerWrapper(TorchProfilerWrapper):
+    """Torch profiler that rebuilds XPU graph executables around the session.
+
+    Graphs replayed in the window are rebuilt under PTI so their kernels are
+    traced, then rebuilt again after stop because executables built under PTI
+    replay incorrectly once collection stops.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        if self._uses_schedule:
+            logger.warning_once(
+                "Profiler warmup/wait iterations are set: XPU graph replay "
+                "kernels will not appear in the trace."
+            )
+
+    def _start(self) -> None:
+        super()._start()
+        if not self._uses_schedule:
+            begin_xpu_graph_profiling()
+
+    def _stop(self) -> None:
+        try:
+            super()._stop()
+        finally:
+            if not self._uses_schedule:
+                start = time.perf_counter()
+                count = end_xpu_graph_profiling()
+                logger.info(
+                    "Rebuilt %d XPU graphs replayed under the profiler in %.2f s",
+                    count,
+                    time.perf_counter() - start,
+                )
 
 
 class XPUWorker(Worker):
@@ -224,6 +263,27 @@ class XPUWorker(Worker):
         else:
             model_runner = XPUModelRunner  # type: ignore[assignment]
         return model_runner(self.vllm_config, self.device)  # type: ignore
+
+    def profile(self, is_start: bool = True, profile_prefix: str | None = None):
+        if (
+            is_start
+            and self.profiler is None
+            and self.profiler_config is not None
+            and self.profiler_config.profiler == "torch"
+        ):
+            from vllm.distributed.utils import get_worker_rank_suffix
+
+            rank_suffix = get_worker_rank_suffix(global_rank=self.rank)
+            activities = self.profiler_config.torch_profiler_activities
+            self.profiler = XPUTorchProfilerWrapper(
+                self.profiler_config,
+                worker_name=(
+                    f"{profile_prefix}_{rank_suffix}" if profile_prefix else rank_suffix
+                ),
+                local_rank=self.local_rank,
+                activities=("CPU", "XPU") if activities is None else tuple(activities),
+            )
+        super().profile(is_start=is_start, profile_prefix=profile_prefix)
 
     def shutdown(self) -> None:
         logger.info(
