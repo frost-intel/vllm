@@ -5,6 +5,7 @@ import os
 import time
 
 import torch
+from torch.profiler import ProfilerAction
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -27,38 +28,57 @@ logger = init_logger(__name__)
 
 
 class XPUTorchProfilerWrapper(TorchProfilerWrapper):
-    """Torch profiler that rebuilds XPU graph executables around the session.
+    """Torch profiler that rebuilds XPU graph executables around PTI collection.
 
-    Graphs replayed in the window are rebuilt under PTI so their kernels are
-    traced, then rebuilt again after stop because executables built under PTI
-    replay incorrectly once collection stops.
+    Graphs replayed while PTI collects are rebuilt under it so their kernels are
+    traced, then rebuilt again once collection ends because executables built
+    under PTI replay incorrectly afterwards. With a profiler schedule, PTI
+    collects from the start of warmup until the active phase ends.
     """
+
+    _PTI_COLLECTING = (
+        ProfilerAction.WARMUP,
+        ProfilerAction.RECORD,
+        ProfilerAction.RECORD_AND_SAVE,
+    )
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        if self._uses_schedule:
-            logger.warning_once(
-                "Profiler warmup/wait iterations are set: XPU graph replay "
-                "kernels will not appear in the trace."
-            )
+        self._graph_profiling = False
+
+    def _sync_graph_profiling(self) -> None:
+        collecting = self.profiler.current_action in self._PTI_COLLECTING
+        if collecting and not self._graph_profiling:
+            begin_xpu_graph_profiling()
+            self._graph_profiling = True
+        elif not collecting and self._graph_profiling:
+            self._end_graph_profiling()
+
+    def _end_graph_profiling(self) -> None:
+        self._graph_profiling = False
+        start = time.perf_counter()
+        count = end_xpu_graph_profiling()
+        logger.info(
+            "Rebuilt %d XPU graphs replayed under the profiler in %.2f s",
+            count,
+            time.perf_counter() - start,
+        )
 
     def _start(self) -> None:
         super()._start()
-        if not self._uses_schedule:
-            begin_xpu_graph_profiling()
+        self._sync_graph_profiling()
+
+    def _profiler_step(self) -> bool:
+        recorded = super()._profiler_step()
+        self._sync_graph_profiling()
+        return recorded
 
     def _stop(self) -> None:
         try:
             super()._stop()
         finally:
-            if not self._uses_schedule:
-                start = time.perf_counter()
-                count = end_xpu_graph_profiling()
-                logger.info(
-                    "Rebuilt %d XPU graphs replayed under the profiler in %.2f s",
-                    count,
-                    time.perf_counter() - start,
-                )
+            if self._graph_profiling:
+                self._end_graph_profiling()
 
 
 class XPUWorker(Worker):
