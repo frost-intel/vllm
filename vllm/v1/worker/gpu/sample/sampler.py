@@ -11,6 +11,7 @@ from vllm.config import VllmConfig
 from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import (
+    _xpu_sample_graph,
     apply_top_k_top_p,
     flashinfer_sample,
     flashinfer_sampler_supported,
@@ -342,7 +343,15 @@ class Sampler:
                     torch.int64
                 )
             else:  # Use XPU sampler
-                sampled, _ = xpu_sample(processed_logits, top_k, top_p)
+                if (
+                    envs.VLLM_XPU_USE_SAMPLER_GRAPH
+                    and not torch.xpu.graphs.is_current_stream_capturing()
+                ):
+                    sampled, _ = _xpu_sample_graph(
+                        processed_logits, top_k, top_p, self.logprobs_mode
+                    )
+                else:
+                    sampled, _ = xpu_sample(processed_logits, top_k, top_p)
         else:
             processed_logits = apply_top_k_top_p(
                 processed_logits, top_k, top_p, has_topp_only_rows=has_topp_only_rows

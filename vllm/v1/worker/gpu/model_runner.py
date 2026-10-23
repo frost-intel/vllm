@@ -1612,6 +1612,137 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         return block_tables, slot_mappings
 
+    def _can_replay_decode_sampling(self, batch_desc, input_batch, scheduler_output):
+        import vllm.envs as envs
+
+        if not (
+            self.device.type == "xpu"
+            and envs.VLLM_XPU_USE_SAMPLER_GRAPH
+            and batch_desc.cg_mode == CUDAGraphMode.FULL
+            and batch_desc.num_tokens == input_batch.num_reqs
+            and input_batch.num_tokens == input_batch.num_reqs
+            and input_batch.num_reqs > 0
+            and input_batch.num_draft_tokens == 0
+            and self.dp_size == 1
+            and not np.any(input_batch.idx_mapping_np < 0)
+            and not np.any(input_batch.is_prefilling_np[:input_batch.num_reqs])
+            and not scheduler_output.has_structured_output_requests
+            and self.is_first_pp_rank and self.is_last_pp_rank
+            and self.batch_sharder is None and self.speculator is None
+            and self.pcp_manager is None and self.lora_config is None
+            and not self.use_aux_hidden_state_outputs
+            and self.ubatch_runner is None
+            and type(self.model_state).__name__ == "DefaultModelState"
+            and self.cudagraph_manager is not None
+            and batch_desc in self.cudagraph_manager.fullgraph_forward_fns
+        ):
+            return False
+        sampler = self.sampler
+        if sampler is None or type(sampler).__name__ != "Sampler":
+            return False
+        indices = input_batch.idx_mapping_np
+        if (
+            np.all(sampler.sampling_states.top_k.np[indices] == self.vocab_size)
+            and np.all(sampler.sampling_states.top_p.np[indices] == 1.0)
+        ):
+            return False
+        if self.prompt_logprobs_worker is not None:
+            if np.any(self.prompt_logprobs_worker.uses_prompt_logprobs[indices]):
+                return False
+        if (
+            not sampler.use_xpu_sampler or sampler.compute_nans
+            or sampler.return_sampling_mask or sampler.trace_replay_state is not None
+            or sampler.thinking_budget_state.enabled
+            or sampler.get_logprobs_dims(indices) is not None
+            or sampler.sampling_states.any_greedy(indices)
+            or sampler.sampling_states.any_explicit_seed(indices)
+            or np.any(sampler.sampling_states.min_p.np[indices] != 0)
+            or len(sampler.logits_processors) != 3
+        ):
+            return False
+        bias, penalties, bad_words = sampler.logits_processors
+        return not (
+            np.any(bias.use_logit_bias[indices])
+            or np.any(penalties.use_penalty[indices])
+            or np.any(bad_words.num_bad_words.np[indices])
+        )
+
+
+    def _replay_decode_sampling(self, batch_desc, input_batch):
+        from vllm.v1.worker.gpu.cudagraph_utils import get_offloader
+        from vllm.v1.worker.gpu.sample.output import SamplerOutput
+
+        manager = self.cudagraph_manager
+        sampler = self.sampler
+        assert manager is not None and sampler is not None
+        get_offloader().sync_prev_onload()
+        if not hasattr(self, "_decode_sampling_graphs"):
+            self._decode_sampling_graphs = {}
+        num_reqs = input_batch.num_reqs
+        generator = torch.xpu.default_generators[self.device.index]
+        rng_state = generator.get_state()
+        seed, offset = rng_state.view(torch.int64).tolist()
+        entry = self._decode_sampling_graphs.get(batch_desc)
+        if entry is None:
+            entry = dict(
+                mapping=torch.empty_like(input_batch.idx_mapping),
+                query_start=torch.empty_like(input_batch.query_start_loc),
+                temperatures=torch.empty(num_reqs, device=self.device),
+                top_k=torch.empty(num_reqs, dtype=torch.int64, device=self.device),
+                top_p=torch.empty(num_reqs, device=self.device),
+                seeds=torch.empty(2, dtype=torch.int64, device=self.device),
+                sampled=torch.empty((num_reqs, 1), dtype=torch.int64, device=self.device),
+                num_sampled=torch.ones(num_reqs, dtype=torch.int32, device=self.device),
+                num_rejected=torch.zeros(num_reqs, dtype=torch.int32, device=self.device),
+                graph=None, copy_event=None,
+            )
+            self._decode_sampling_graphs[batch_desc] = entry
+        if entry["copy_event"] is not None:
+            self.main_stream.wait_event(entry["copy_event"])
+        entry["mapping"].copy_(input_batch.idx_mapping)
+        entry["query_start"].copy_(input_batch.query_start_loc)
+        states = sampler.sampling_states
+        indices = input_batch.idx_mapping_np
+        for name, source in (("temperatures", states.temperature.np),
+                             ("top_k", states.top_k.np), ("top_p", states.top_p.np)):
+            entry[name].copy_(torch.as_tensor(source[indices].copy()))
+        entry["seeds"].copy_(torch.tensor([seed, offset], dtype=torch.int64))
+
+        def sample_body():
+            assert manager.hidden_states is not None
+            logits = self.model.compute_logits(manager.hidden_states[:num_reqs])
+            logits = logits.float().contiguous()
+            logits.div_(entry["temperatures"].unsqueeze(1))
+            torch.ops._xpu_C.topk_topp_sampler(
+                entry["sampled"].view(-1), None, logits, entry["top_k"],
+                entry["top_p"], "raw_logprobs", entry["seeds"], 1.0,
+            )
+
+        if entry["graph"] is None:
+            sample_body()
+            torch.xpu.synchronize(self.device)
+            graph = torch.xpu.graphs.XPUGraph()
+            with torch.xpu.graphs.graph(graph):
+                manager.fullgraph_forward_fns[batch_desc](CUDAGraphMode.FULL)
+                sample_body()
+                self.postprocess_sampled(
+                    entry["mapping"], entry["sampled"], entry["num_sampled"],
+                    entry["num_rejected"], entry["query_start"],
+                )
+            entry["graph"] = graph
+        with torch.profiler.record_function("decode_model_and_sampling:replay"):
+            entry["graph"].replay()
+        rng_state.view(torch.int64)[1] = (offset + num_reqs * self.vocab_size + 3) // 4 * 4
+        generator.set_state(rng_state)
+        self._decode_sampling_entry = entry
+        self._decode_sampling_output = SamplerOutput(
+            sampled_token_ids=entry["sampled"], logprobs_tensors=None,
+            num_nans=None, num_sampled=entry["num_sampled"],
+            num_rejected=entry["num_rejected"],
+        )
+        return manager.hidden_states[:batch_desc.num_tokens]
+
+
     def sample(
         self,
         hidden_states: torch.Tensor,
@@ -2020,6 +2151,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         self.step_timing.forward_start()
 
+        self._decode_sampling_output = None
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
@@ -2029,7 +2161,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_connector.pre_forward(
                 scheduler_output, input_batch, attn_metadata=attn_metadata
             )
-            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+            if not dummy_run and self._can_replay_decode_sampling(
+                batch_desc, input_batch, scheduler_output
+            ):
+                model_output = self._replay_decode_sampling(batch_desc, input_batch)
+            else:
+                model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
         else:
             # For piecewise and eager mode, just call model().
             batch_descriptor = BatchDescriptor(
@@ -2160,9 +2297,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.pcp_manager.restore_for_sampling(hidden_states, aux_hidden_states)
             )
 
-        sampler_output, num_sampled, num_rejected = self.sample(
-            hidden_states, input_batch, grammar_output
-        )
+        combined_output = getattr(self, "_decode_sampling_output", None)
+        if combined_output is not None:
+            assert grammar_output is None
+            sampler_output = combined_output
+            num_sampled = sampler_output.num_sampled
+            num_rejected = sampler_output.num_rejected
+            self._decode_sampling_output = None
+        else:
+            sampler_output, num_sampled, num_rejected = self.sample(
+                hidden_states, input_batch, grammar_output
+            )
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
@@ -2246,13 +2391,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # ensuring that `copy_event` is recorded before calling postprocess.
         # This sequencing may slightly reduce latency as async D2H copy does not
         # need to wait for the postprocess to finish.
-        self.postprocess_sampled(
-            input_batch.idx_mapping,
-            sampler_output.sampled_token_ids,
-            num_sampled,
-            num_rejected,
-            input_batch.query_start_loc,
-        )
+        if combined_output is not None:
+            self._decode_sampling_entry["copy_event"] = async_output.copy_event
+        else:
+            self.postprocess_sampled(
+                input_batch.idx_mapping,
+                sampler_output.sampled_token_ids,
+                num_sampled,
+                num_rejected,
+                input_batch.query_start_loc,
+            )
 
         if self.speculator is not None:
             assert self.sampler is not None

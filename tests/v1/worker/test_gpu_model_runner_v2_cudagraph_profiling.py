@@ -15,11 +15,13 @@ import gc
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import pytest
 import torch
 
 from tests.utils import create_new_process_for_each_test
 from vllm.compilation.counter import compilation_counter
+from vllm.config import ParallelConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu import cudagraph_utils as cgu
 from vllm.v1.worker.gpu import model_runner as mrv2
@@ -27,6 +29,61 @@ from vllm.v1.worker.gpu.eplb_utils import EPLBController
 
 GLOBAL_POOL = "global-pool"
 THROWAWAY_POOL = "throwaway-pool"
+
+
+@pytest.mark.parametrize(
+    "unsupported", [None, "prefill", "grammar", "seed", "min_p",
+                    "penalty", "draft", "prompt_logprobs"]
+)
+def test_combined_decode_graph_rejects_unsupported_requests(monkeypatch, unsupported):
+    from vllm import envs
+
+    monkeypatch.setattr(envs, "VLLM_XPU_USE_SAMPLER_GRAPH", True)
+    runner = mrv2.GPUModelRunner.__new__(mrv2.GPUModelRunner)
+    runner.device = torch.device("xpu:0")
+    runner.parallel_config = ParallelConfig(data_parallel_size=1)
+    runner.vocab_size = 1024
+    runner.is_first_pp_rank = runner.is_last_pp_rank = True
+    runner.batch_sharder = runner.speculator = runner.pcp_manager = None
+    runner.lora_config = runner.ubatch_runner = None
+    runner.use_aux_hidden_state_outputs = False
+    runner.model_state = type("DefaultModelState", (), {})()
+    runner.prompt_logprobs_worker = SimpleNamespace(
+        uses_prompt_logprobs=np.array([unsupported == "prompt_logprobs"])
+    )
+    desc = cgu.BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.FULL, num_tokens=1, num_reqs=1
+    )
+    runner.cudagraph_manager = SimpleNamespace(fullgraph_forward_fns={desc: None})
+    batch = SimpleNamespace(
+        num_tokens=1, num_reqs=1, num_draft_tokens=int(unsupported == "draft"),
+        idx_mapping_np=np.array([0]),
+        is_prefilling_np=np.array([unsupported == "prefill"]),
+    )
+    scheduler = SimpleNamespace(has_structured_output_requests=unsupported == "grammar")
+    states = SimpleNamespace(
+        top_k=SimpleNamespace(np=np.array([50])),
+        top_p=SimpleNamespace(np=np.array([0.9])),
+        any_greedy=lambda indices: False,
+        any_explicit_seed=lambda indices: unsupported == "seed",
+        min_p=SimpleNamespace(np=np.array([0.1 if unsupported == "min_p" else 0.0])),
+    )
+    sampler = type("Sampler", (), {})()
+    sampler.use_xpu_sampler = True
+    sampler.compute_nans = sampler.return_sampling_mask = False
+    sampler.trace_replay_state = None
+    sampler.thinking_budget_state = SimpleNamespace(enabled=False)
+    sampler.get_logprobs_dims = lambda indices: None
+    sampler.sampling_states = states
+    sampler.logits_processors = [
+        SimpleNamespace(use_logit_bias=np.array([False])),
+        SimpleNamespace(use_penalty=np.array([unsupported == "penalty"])),
+        SimpleNamespace(num_bad_words=SimpleNamespace(np=np.array([0]))),
+    ]
+    runner.sampler = sampler
+    assert runner._can_replay_decode_sampling(desc, batch, scheduler) == (
+        unsupported is None
+    )
 
 
 class _FakeCudaGraphManager:

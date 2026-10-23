@@ -3,6 +3,8 @@
 
 from subprocess import CalledProcessError
 
+import threading
+
 import torch
 import torch.nn as nn
 
@@ -223,6 +225,88 @@ def xpu_sample(
     generator.set_state(state)
     return sampled, logits_to_return
 
+
+_xpu_sampler_graphs: dict[tuple, tuple] = {}
+_xpu_sampler_graph_lock = threading.RLock()
+
+
+def _xpu_sample_graph(
+    logits: torch.Tensor,
+    k: torch.Tensor | None,
+    p: torch.Tensor | None,
+    logprobs_mode: LogprobsMode,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    logits = logits.contiguous()
+    k = k.contiguous() if k is not None else None
+    p = p.contiguous() if p is not None else None
+    key = (
+        logits.device.index,
+        tuple(logits.shape),
+        logits.dtype,
+        tuple(k.shape) if k is not None else None,
+        k.dtype if k is not None else None,
+        tuple(p.shape) if p is not None else None,
+        p.dtype if p is not None else None,
+        logprobs_mode,
+    )
+    generator = torch.xpu.default_generators[logits.device.index]
+    with _xpu_sampler_graph_lock:
+        state = generator.get_state()
+        seed, offset = state.view(torch.int64).tolist()
+        entry = _xpu_sampler_graphs.get(key)
+        if entry is None:
+            static_logits = torch.empty_like(logits)
+            static_sampled = torch.empty(logits.shape[0], dtype=torch.int64, device=logits.device)
+            static_return = (
+                torch.empty_like(logits, dtype=torch.float32)
+                if logprobs_mode in PROCESSED_LOGPROBS_MODES else None
+            )
+            static_k = torch.empty_like(k) if k is not None else None
+            static_p = torch.empty_like(p) if p is not None else None
+            static_seeds = torch.empty(2, dtype=torch.int64, device=logits.device)
+
+            static_logits.copy_(logits)
+            if static_k is not None and k is not None:
+                static_k.copy_(k)
+            if static_p is not None and p is not None:
+                static_p.copy_(p)
+            static_seeds.copy_(torch.tensor([seed, offset], dtype=torch.int64))
+
+            def launch():
+                kernel_logits = static_logits.to(dtype=torch.float32)
+                kernel_k = static_k.to(dtype=torch.int64) if static_k is not None else None
+                torch.ops._xpu_C.topk_topp_sampler(
+                    static_sampled, static_return, kernel_logits, kernel_k,
+                    static_p, logprobs_mode, static_seeds, 1.0
+                )
+
+            launch()
+            torch.xpu.synchronize()
+            graph = torch.xpu.graphs.XPUGraph()
+            with torch.xpu.graphs.graph(graph):
+                launch()
+            entry = (graph, static_logits, static_sampled, static_return,
+                     static_k, static_p, static_seeds)
+            _xpu_sampler_graphs[key] = entry
+            if len(_xpu_sampler_graphs) > 16:
+                _xpu_sampler_graphs.pop(next(iter(_xpu_sampler_graphs)))
+
+        graph, static_logits, static_sampled, static_return, static_k, static_p, static_seeds = entry
+        static_logits.copy_(logits)
+        if static_k is not None and k is not None:
+            static_k.copy_(k)
+        if static_p is not None and p is not None:
+            static_p.copy_(p)
+        static_seeds.copy_(torch.tensor([seed, offset], dtype=torch.int64))
+        graph.replay()
+
+        offset = (offset + logits.numel() + 3) // 4 * 4
+        state.view(torch.int64)[1] = offset
+        generator.set_state(state)
+        return (
+            static_sampled.clone(),
+            static_return.clone() if static_return is not None else None,
+        )
 
 class TopKTopPSampler(nn.Module):
     """Module that performs optional top-k and top-p filtering followed by
@@ -495,6 +579,11 @@ class TopKTopPSampler(nn.Module):
                 "PyTorch-native implementation."
             )
             return self.forward_native(logits, generators, k, p)
+        if (
+            envs.VLLM_XPU_USE_SAMPLER_GRAPH
+            and not torch.xpu.graphs.is_current_stream_capturing()
+        ):
+            return _xpu_sample_graph(logits, k, p, self.logprobs_mode)
         return xpu_sample(logits, k, p, self.logprobs_mode)
 
 
