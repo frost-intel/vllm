@@ -329,6 +329,7 @@ if TYPE_CHECKING:
     VLLM_XPU_FORCE_N_CONTIG_WEIGHT: bool = False
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
     VLLM_XPU_INC_WNA16_BACKEND: Literal["auto", "ark", "w4a16", "w4a8"] = "auto"
+    VLLM_XPU_W8A16_BLOCK_FP8: bool | None = None
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
@@ -2234,6 +2235,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Which one is fastest is device-dependent, so this is left as an opt-in.
     "VLLM_XPU_INC_WNA16_BACKEND": env_with_choices(
         "VLLM_XPU_INC_WNA16_BACKEND", "auto", ["auto", "ark", "w4a16", "w4a8"]
+    ),
+    # Route XPU block-scaled FP8 dense linear through the fused w8a16 GEMM.
+    # Unset: enabled on PVC (Data Center GPU Max) only. "0"/"1" forces it.
+    "VLLM_XPU_W8A16_BLOCK_FP8": lambda: maybe_convert_bool(
+        os.getenv("VLLM_XPU_W8A16_BLOCK_FP8")
     ),
     # Enable simple KV offload.
     "VLLM_USE_SIMPLE_KV_OFFLOAD": lambda: bool(

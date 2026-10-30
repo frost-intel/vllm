@@ -580,20 +580,28 @@ def get_requests(args, tokenizer):
     mm_backends = ("vllm", "vllm-chat")
     requests = get_samples(serve_args, tokenizer, multimodal_backends=mm_backends)
     requests = assign_loras(requests, args)
-    requests = filter_requests_for_dp(requests, args.data_parallel_size)
+    requests = filter_requests_for_dp(requests, args)
     return requests
 
 
-def filter_requests_for_dp(requests, data_parallel_size):
+def filter_requests_for_dp(requests, args):
     # Note(zhuohan): The way we get data_parallel_rank is hacky and only
     # works for external launcher mode. Should be cleaned up and deprecated
     # in the future with a better vLLM distributed process design.
+    data_parallel_size = args.data_parallel_size
     if data_parallel_size == 1:
         return requests
 
-    global_rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    data_parallel_rank = global_rank // (world_size // data_parallel_size)
+    from vllm.config.parallel import external_launcher_dp_rank
+
+    data_parallel_rank = external_launcher_dp_rank(
+        rank=int(os.environ["RANK"]),
+        world_size=int(os.environ["WORLD_SIZE"]),
+        data_parallel_size=data_parallel_size,
+        tensor_parallel_size=args.tensor_parallel_size,
+        prefill_context_parallel_size=getattr(args, "prefill_context_parallel_size", 1),
+        rank_layout=getattr(args, "rank_layout", "default"),
+    )
     return [
         r
         for i, r in enumerate(requests)

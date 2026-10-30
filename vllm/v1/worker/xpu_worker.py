@@ -2,12 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
 import os
+import time
 
 import torch
+from torch.profiler import ProfilerAction
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.profiler.wrapper import TorchProfilerWrapper
 from vllm.utils.mem_utils import MemorySnapshot, format_gib
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
@@ -15,11 +18,67 @@ from vllm.v1.worker.xpu_model_runner import (
     XPUMMEncoderModelRunner,
     XPUModelRunner,
     XPUModelRunnerV2,
+    begin_xpu_graph_profiling,
+    end_xpu_graph_profiling,
 )
 
 from .utils import request_memory
 
 logger = init_logger(__name__)
+
+
+class XPUTorchProfilerWrapper(TorchProfilerWrapper):
+    """Torch profiler that rebuilds XPU graph executables around PTI collection.
+
+    Graphs replayed while PTI collects are rebuilt under it so their kernels are
+    traced, then rebuilt again once collection ends because executables built
+    under PTI replay incorrectly afterwards. With a profiler schedule, PTI
+    collects from the start of warmup until the active phase ends.
+    """
+
+    _PTI_COLLECTING = (
+        ProfilerAction.WARMUP,
+        ProfilerAction.RECORD,
+        ProfilerAction.RECORD_AND_SAVE,
+    )
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._graph_profiling = False
+
+    def _sync_graph_profiling(self) -> None:
+        collecting = self.profiler.current_action in self._PTI_COLLECTING
+        if collecting and not self._graph_profiling:
+            begin_xpu_graph_profiling()
+            self._graph_profiling = True
+        elif not collecting and self._graph_profiling:
+            self._end_graph_profiling()
+
+    def _end_graph_profiling(self) -> None:
+        self._graph_profiling = False
+        start = time.perf_counter()
+        count = end_xpu_graph_profiling()
+        logger.info(
+            "Rebuilt %d XPU graphs replayed under the profiler in %.2f s",
+            count,
+            time.perf_counter() - start,
+        )
+
+    def _start(self) -> None:
+        super()._start()
+        self._sync_graph_profiling()
+
+    def _profiler_step(self) -> bool:
+        recorded = super()._profiler_step()
+        self._sync_graph_profiling()
+        return recorded
+
+    def _stop(self) -> None:
+        try:
+            super()._stop()
+        finally:
+            if self._graph_profiling:
+                self._end_graph_profiling()
 
 
 class XPUWorker(Worker):
@@ -224,6 +283,27 @@ class XPUWorker(Worker):
         else:
             model_runner = XPUModelRunner  # type: ignore[assignment]
         return model_runner(self.vllm_config, self.device)  # type: ignore
+
+    def profile(self, is_start: bool = True, profile_prefix: str | None = None):
+        if (
+            is_start
+            and self.profiler is None
+            and self.profiler_config is not None
+            and self.profiler_config.profiler == "torch"
+        ):
+            from vllm.distributed.utils import get_worker_rank_suffix
+
+            rank_suffix = get_worker_rank_suffix(global_rank=self.rank)
+            activities = self.profiler_config.torch_profiler_activities
+            self.profiler = XPUTorchProfilerWrapper(
+                self.profiler_config,
+                worker_name=(
+                    f"{profile_prefix}_{rank_suffix}" if profile_prefix else rank_suffix
+                ),
+                local_rank=self.local_rank,
+                activities=("CPU", "XPU") if activities is None else tuple(activities),
+            )
+        super().profile(is_start=is_start, profile_prefix=profile_prefix)
 
     def shutdown(self) -> None:
         logger.info(

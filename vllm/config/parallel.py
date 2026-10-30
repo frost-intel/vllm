@@ -37,6 +37,7 @@ _NUMACTL_CPUSET_PATTERN = re.compile(r"^\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*$")
 ExpertPlacementStrategy = Literal["linear", "round_robin"]
 DistributedExecutorBackend = Literal["ray", "mp", "uni", "external_launcher"]
 DataParallelBackend = Literal["ray", "mp"]
+RankLayout = Literal["default", "pp_outer"]
 EPLBPolicyOption = Literal["default"]
 DCPCommBackend = Literal["ag_rs", "a2a"]
 EPLBCommunicatorBackend = Literal[
@@ -133,6 +134,23 @@ class EPLBConfig:
         return self
 
 
+def external_launcher_dp_rank(
+    rank: int,
+    world_size: int,
+    data_parallel_size: int,
+    tensor_parallel_size: int,
+    prefill_context_parallel_size: int,
+    rank_layout: RankLayout,
+) -> int:
+    """DP rank of a process started by an external launcher (torchrun/mpiexec),
+    where `world_size` counts the ranks of all DP replicas."""
+    if rank_layout == "pp_outer":
+        return (
+            rank // (tensor_parallel_size * prefill_context_parallel_size)
+        ) % data_parallel_size
+    return rank // (world_size // data_parallel_size)
+
+
 @config
 class ParallelConfig:
     """Configuration for the distributed execution."""
@@ -180,6 +198,13 @@ class ParallelConfig:
     between local data parallel ranks, but an external LB balances
     between vLLM nodes/replicas. Set explicitly in conjunction with
     --data-parallel-start-rank."""
+    rank_layout: RankLayout = "default"
+    """Order in which global ranks map to parallel coordinates. "default" is
+    DP x PP x PCP x TP (TP varies fastest). "pp_outer" is PP x DP x PCP x TP:
+    when the launcher packs consecutive ranks per node (e.g. `mpiexec -ppn`),
+    each node holds one PP stage of every DP replica, which keeps each stage's
+    EP group on one node. Requires the external_launcher backend: the built-in
+    executors place ranks on nodes assuming DP is outermost."""
     is_moe_model: bool | None = None
     """Whether the deployed model is MoE (if known)."""
     enable_hc_sp: bool = False
@@ -995,13 +1020,27 @@ class ParallelConfig:
                         "--eplb-config.use_async=false."
                     )
 
+        if self.rank_layout == "pp_outer" and (
+            self.distributed_executor_backend != "external_launcher"
+            or self.enable_elastic_ep
+        ):
+            raise ValueError(
+                "rank_layout='pp_outer' is only supported with the "
+                "external_launcher backend, without elastic EP."
+            )
+
         if self.data_parallel_size > 1 or self.data_parallel_size_local == 0:
             # Data parallel was specified in the engine args.
             if self.distributed_executor_backend == "external_launcher":
                 # For external launcher,
                 # we need to set the data parallel rank automatically
-                self.data_parallel_rank = int(os.environ["RANK"]) // (
-                    self.world_size // self.data_parallel_size
+                self.data_parallel_rank = external_launcher_dp_rank(
+                    rank=int(os.environ["RANK"]),
+                    world_size=self.world_size,
+                    data_parallel_size=self.data_parallel_size,
+                    tensor_parallel_size=self.tensor_parallel_size,
+                    prefill_context_parallel_size=self.prefill_context_parallel_size,
+                    rank_layout=self.rank_layout,
                 )
                 logger.info(
                     "Set data_parallel_rank to %d automatically.",
