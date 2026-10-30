@@ -63,6 +63,7 @@ from vllm.utils.torch_utils import (
 )
 
 if TYPE_CHECKING:
+    from vllm.config.parallel import RankLayout
     from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
 
 
@@ -2076,6 +2077,32 @@ def _engram_dp_shard_size(
     return shard_size
 
 
+def rank_layout_tensor(
+    world_size: int,
+    data_parallel_size: int,
+    pipeline_model_parallel_size: int,
+    prefill_context_model_parallel_size: int,
+    tensor_model_parallel_size: int,
+    rank_layout: "RankLayout" = "default",
+) -> torch.Tensor:
+    """Global ranks indexed by [ExternalDP, DP, PP, PCP, TP] coordinates.
+
+    "default" assigns ranks in that order (TP fastest). "pp_outer" assigns
+    them as ExternalDP x PP x DP x PCP x TP, so consecutive ranks fill one PP
+    stage of every DP replica before moving to the next stage.
+    """
+    dp, pp = data_parallel_size, pipeline_model_parallel_size
+    pcp, tp = prefill_context_model_parallel_size, tensor_model_parallel_size
+    if rank_layout == "pp_outer":
+        return (
+            torch.arange(world_size)
+            .reshape(-1, pp, dp, pcp, tp)
+            .transpose(1, 2)
+            .contiguous()
+        )
+    return torch.arange(world_size).reshape(-1, dp, pp, pcp, tp)
+
+
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
@@ -2147,6 +2174,8 @@ def initialize_model_parallel(
         )
 
     # the layout order is: ExternalDP x DP x PP x PCP x TP
+    # (or ExternalDP x PP x DP x PCP x TP with rank_layout="pp_outer"; either
+    # way all_ranks is indexed by [ExternalDP, DP, PP, PCP, TP] coordinates).
     # ExternalDP is the data parallel group that is not part of the model,
     # every dp rank can generate independently (in verl integration).
     # DP is the data parallel group that is part of the model,
@@ -2155,13 +2184,14 @@ def initialize_model_parallel(
     # otherwise it will cause deadlock.
     # to get group_ranks for each dimension, transpose that dimension to the
     # last dimension, then reshape to 2D, then unbind the last dimension
-    all_ranks = torch.arange(world_size).reshape(
-        -1,
+    all_ranks = rank_layout_tensor(
+        world_size,
         data_parallel_size,
         pipeline_model_parallel_size,
         prefill_context_model_parallel_size,
         tensor_model_parallel_size,
-    )  # noqa
+        parallel_config.rank_layout,
+    )
 
     # Build the tensor model-parallel groups.
     global _TP
