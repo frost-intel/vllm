@@ -609,6 +609,9 @@ class ModelCudaGraphManager(CudaGraphManager):
         self.aux_hidden_states: list[torch.Tensor] = []
         self.use_aux_hidden_state_outputs = False
         self.intermediate_tensors: IntermediateTensors | None = None
+        self.fullgraph_forward_fns: dict[
+            BatchExecutionDescriptor, Callable[[CUDAGraphMode], None]
+        ] = {}
 
     def capture(
         self,
@@ -783,6 +786,8 @@ class ModelCudaGraphManager(CudaGraphManager):
 
                 store_capture_output(num_tokens, model_output)
 
+            if desc.cg_mode == CUDAGraphMode.FULL:
+                self.fullgraph_forward_fns[desc] = forward_fn
             return forward_fn
 
         super().capture(create_forward_fn, progress_bar_desc)

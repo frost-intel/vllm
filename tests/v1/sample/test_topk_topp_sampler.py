@@ -61,6 +61,49 @@ def reset_default_device():
     torch.set_default_device(original_device)
 
 
+@pytest.mark.skipif(not current_platform.is_xpu(), reason="XPU sampler graph test")
+def test_xpu_sampler_graph_replay_matches_eager_rng(monkeypatch: pytest.MonkeyPatch):
+    import vllm._xpu_ops  # noqa: F401
+    import vllm_xpu_kernels._xpu_C  # noqa: F401
+    from vllm import envs
+    from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler, _xpu_sampler_graphs
+
+    torch.xpu.set_device(0)
+    device = torch.device("xpu:0")
+    sampler = TopKTopPSampler()
+    generator = torch.xpu.default_generators[device.index]
+    _xpu_sampler_graphs.clear()
+    k = torch.full((2,), 8, dtype=torch.int32, device=device)
+    p = torch.full((2,), 0.9, dtype=torch.float32, device=device)
+    logits = torch.randn((2, 128), dtype=torch.float32, device=device)
+
+    def eager_sample(input_logits):
+        monkeypatch.setattr(envs, "VLLM_XPU_USE_SAMPLER_GRAPH", False)
+        return sampler.forward_xpu(input_logits, {}, k, p)
+
+    def graph_sample(input_logits):
+        monkeypatch.setattr(envs, "VLLM_XPU_USE_SAMPLER_GRAPH", True)
+        return sampler.forward_xpu(input_logits, {}, k, p)
+
+    set_random_seed(12345)
+    eager, _ = eager_sample(logits)
+    eager_state = generator.get_state()
+    set_random_seed(12345)
+    replayed, _ = graph_sample(logits)
+    torch.testing.assert_close(replayed, eager, atol=0, rtol=0)
+    torch.testing.assert_close(generator.get_state(), eager_state, atol=0, rtol=0)
+
+    next_logits = torch.randn_like(logits)
+    set_random_seed(12345)
+    eager_sample(logits)
+    eager_next, _ = eager_sample(next_logits)
+    set_random_seed(12345)
+    graph_sample(logits)
+    replayed_next, _ = graph_sample(next_logits)
+    torch.testing.assert_close(replayed_next, eager_next, atol=0, rtol=0)
+    _xpu_sampler_graphs.clear()
+
+
 def test_sampler_threads_fp64_gumbel_to_topk_topp_sampler():
     sampler = Sampler(use_fp64_gumbel=True)
 
