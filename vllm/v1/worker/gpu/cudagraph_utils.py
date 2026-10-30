@@ -178,6 +178,7 @@ class CudaGraphManager:
         self._lora_dispatch_map, self._max_lora_case = self._build_lora_dispatch_map()
 
         self.graphs: dict[BatchExecutionDescriptor, torch.cuda.CUDAGraph] = {}
+        self.sampling_graphs: dict[int, dict[str, Any]] = {}
         self.pool = current_platform.get_global_graph_pool() if cudagraph_mode else None
 
         self._graphs_captured = False
@@ -406,6 +407,7 @@ class CudaGraphManager:
         kept, so `needs_capture()` still reports the work to redo.
         """
         self.graphs.clear()
+        self.sampling_graphs.clear()
         self._graphs_captured = False
         if self.breakable_cg_runner is not None:
             BreakableCUDAGraphWrapper.clear_all_graphs()

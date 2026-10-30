@@ -10,3 +10,21 @@ vLLM uses the following environment variables to configure the system:
 ```python
 --8<-- "vllm/envs.py:env-vars-definition"
 ```
+
+## XPU Sampling Graphs
+
+Set `VLLM_XPU_USE_SAMPLER_GRAPH=1` with the V2 model runner and model FULL
+graphs enabled to capture separate logits-and-sampling graphs during startup
+dummy execution. `sample_tokens` RPCs replay these graphs for eligible decode
+batches.
+
+This opt-in path requires the fused XPU sampler and an XPU-kernels build that
+accepts a device-resident shared `[seed, offset]` tensor. Capture sizes come from
+`cudagraph_capture_sizes`, limited to `max_num_seqs`. Only exact batch sizes
+match; other batches use normal sampling. Sampling graph memory is included in
+startup graph-memory profiling and released with the model graph manager.
+
+Currently supported: TP>=1, PP>=1, DP1, non-speculative one-token decode, positive
+temperature, and top-k/top-p sampling without explicit per-request seeds.
+Grammar, logprobs, logits processors, LoRA, sampling masks, batch sharding,
+context parallelism, and microbatching fall back to normal sampling.
