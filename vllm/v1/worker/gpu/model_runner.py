@@ -1736,8 +1736,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             sample_body()
             torch.xpu.synchronize(self.device)
-            graph = torch.xpu.graphs.XPUGraph()
-            with torch.xpu.graphs.graph(graph, pool=pool):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=pool):
                 sample_body()
             entry["graph"] = graph
             manager.sampling_graphs[num_reqs] = entry
