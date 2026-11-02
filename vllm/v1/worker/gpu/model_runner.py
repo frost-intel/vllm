@@ -1701,7 +1701,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if not 0 < num_reqs <= min(self.max_num_reqs, 64):  # Use for BS <= 64
                 continue
             entry = dict(
-                hidden_states=torch.zeros_like(manager.hidden_states[:num_reqs]),
+                hidden_states=manager.hidden_states[:num_reqs],
                 temperatures=torch.ones(num_reqs, device=self.device),
                 top_k=torch.full(
                     (num_reqs,), self.vocab_size, dtype=torch.int64, device=self.device
