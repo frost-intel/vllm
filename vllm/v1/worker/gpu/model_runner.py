@@ -1757,13 +1757,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if hidden_states.data_ptr() != manager.hidden_states.data_ptr():
             entry["hidden_states"].copy_(hidden_states[input_batch.logits_indices])
         states = sampler.sampling_states
-        indices = input_batch.idx_mapping_np
+        indices = input_batch.idx_mapping
         for name, source in (
-            ("temperatures", states.temperature.np),
-            ("top_k", states.top_k.np),
-            ("top_p", states.top_p.np),
+            ("temperatures", states.temperature.gpu),
+            ("top_k", states.top_k.gpu),
+            ("top_p", states.top_p.gpu),
         ):
-            entry[name].copy_(torch.as_tensor(source[indices].copy()))
+            torch.index_select(source, 0, indices, out=entry[name])
         generator = torch.xpu.default_generators[self.device.index]
         rng_state = generator.get_state()
         seed, offset = rng_state.view(torch.int64).tolist()
