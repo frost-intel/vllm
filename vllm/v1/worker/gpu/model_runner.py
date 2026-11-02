@@ -1779,8 +1779,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             sampled_token_ids=entry["sampled"].clone(),
             logprobs_tensors=None,
             num_nans=None,
-            num_sampled=entry["num_sampled"].clone(),
-            num_rejected=entry["num_rejected"].clone(),
+            num_sampled=entry["num_sampled"],
+            num_rejected=entry["num_rejected"],
         )
         return output, output.num_sampled, output.num_rejected
 
