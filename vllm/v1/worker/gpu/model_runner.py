@@ -1754,7 +1754,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         assert manager is not None and sampler is not None
         num_reqs = input_batch.num_reqs
         entry = manager.sampling_graphs[num_reqs]
-        entry["hidden_states"].copy_(hidden_states[input_batch.logits_indices])
+        if hidden_states.data_ptr() != manager.hidden_states.data_ptr():
+            entry["hidden_states"].copy_(hidden_states[input_batch.logits_indices])
         states = sampler.sampling_states
         indices = input_batch.idx_mapping_np
         for name, source in (
