@@ -1716,7 +1716,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return
         pool = torch.xpu.graph_pool_handle()
         for num_reqs in sorted(set(self.compilation_config.cudagraph_capture_sizes)):
-            if not 0 < num_reqs <= self.max_num_reqs:
+            if not 0 < num_reqs <= min(self.max_num_reqs, 64):  # Use for BS <= 64
                 continue
             entry = dict(
                 hidden_states=torch.zeros_like(manager.hidden_states[:num_reqs]),
