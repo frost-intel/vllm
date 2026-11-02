@@ -1784,7 +1784,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         generator = torch.xpu.default_generators[self.device.index]
         rng_state = generator.get_state()
         seed, offset = rng_state.view(torch.int64).tolist()
-        entry["seeds"].copy_(torch.tensor([seed, offset], dtype=torch.int64))
+        entry["seeds"].copy_(torch.tensor([seed, offset], dtype=torch.int64), non_blocking=True)
         with torch.profiler.record_function("sample_tokens_graph:replay"):
             entry["graph"].replay()
         entry["num_replays"] += 1
