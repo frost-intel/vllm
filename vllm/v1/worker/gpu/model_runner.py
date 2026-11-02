@@ -1128,10 +1128,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             self.lora_config, self
                         ),
                     )
-                    if self.sampler is not None:
+                    if (
+                        envs.VLLM_XPU_USE_SAMPLE_GRAPH
+                        and self.is_last_pp_rank
+                        and self.sampler is not None
+                    ):
                         with graph_capture(device=self.device):
-                            if self.is_last_pp_rank and self.sampler is not None:
-                                self._capture_sampling_graphs()
+                            self._capture_sampling_graphs()
                     self.model_state.capture_inner_cudagraphs(
                         input_buffers,
                         self.block_tables,
