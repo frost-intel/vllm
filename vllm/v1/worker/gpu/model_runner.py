@@ -1722,7 +1722,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 hidden_states=manager.hidden_states[:num_reqs],
                 temperatures=torch.ones(num_reqs, device=self.device),
                 top_k=torch.full(
-                    (num_reqs,), self.vocab_size, dtype=torch.int64, device=self.device
+                    (num_reqs,), self.vocab_size, dtype=torch.int32, device=self.device
                 ),
                 top_p=torch.ones(num_reqs, device=self.device),
                 seeds=torch.zeros(2, dtype=torch.int64, device=self.device),
@@ -1745,7 +1745,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     entry["sampled"].view(-1),
                     None,
                     logits,
-                    entry["top_k"],
+                    entry["top_k"].long(),
                     entry["top_p"],
                     "raw_logprobs",
                     entry["seeds"],
