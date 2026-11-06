@@ -113,6 +113,7 @@ from vllm.config.parallel import (
     DCPCommBackend,
     DistributedExecutorBackend,
     ExpertPlacementStrategy,
+    RankLayout,
 )
 from vllm.config.scheduler import SchedulerPolicy
 from vllm.config.utils import get_field
@@ -465,6 +466,12 @@ _MAMBA_CACHE_MODE_DEPRECATION_MESSAGE = (
 )
 
 
+_IR_OP_PRIORITY_DEPRECATION_MESSAGE = (
+    "ir_op_priority (--ir-op-priority) is deprecated because vLLM IR is being "
+    "removed. It will be removed in v0.34.0."
+)
+
+
 _DISABLE_CASCADE_ATTN_DEPRECATION_MESSAGE = (
     "--disable-cascade-attn is deprecated and has no effect since cascade "
     "attention has been removed. It will be removed in v0.33.0."
@@ -556,6 +563,7 @@ class EngineArgs:
     data_parallel_external_lb: bool = False
     data_parallel_multi_port_external_lb: bool = False
     data_parallel_backend: DataParallelBackend = ParallelConfig.data_parallel_backend
+    rank_layout: RankLayout = ParallelConfig.rank_layout
     enable_hc_sp: bool = ParallelConfig.enable_hc_sp
     enable_expert_parallel: bool = ParallelConfig.enable_expert_parallel
     enable_batch_sharded_sampling: bool | None = (
@@ -1294,6 +1302,7 @@ class EngineArgs:
             "server per local data parallel rank and exposes aggregated health on "
             "a supervisor port.",
         )
+        parallel_group.add_argument("--rank-layout", **parallel_kwargs["rank_layout"])
         parallel_group.add_argument("--enable-hc-sp", **parallel_kwargs["enable_hc_sp"])
         parallel_group.add_argument(
             "--enable-expert-parallel",
@@ -2578,6 +2587,7 @@ class EngineArgs:
             data_parallel_rpc_port=data_parallel_rpc_port,
             data_parallel_backend=self.data_parallel_backend,
             data_parallel_hybrid_lb=self.data_parallel_hybrid_lb,
+            rank_layout=self.rank_layout,
             is_moe_model=model_config.is_moe,
             enable_hc_sp=self.enable_hc_sp,
             enable_expert_parallel=self.enable_expert_parallel,
@@ -2813,6 +2823,8 @@ class EngineArgs:
 
             # Set the attribute
             setattr(kernel_config.ir_op_priority, op_name, op_priority)
+        if any(asdict(kernel_config.ir_op_priority).values()):
+            logger.warning_once(_IR_OP_PRIORITY_DEPRECATION_MESSAGE)
 
         load_config = self.create_load_config()
 

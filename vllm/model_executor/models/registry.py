@@ -98,6 +98,7 @@ _TEXT_GENERATION_MODELS = {
     ),
     "DeepseekV4ForCausalLM": ("vllm.models.deepseek_v4", "DeepseekV4ForCausalLM"),
     "DomynEdgeForCausalLM": ("domyn_edge", "DomynEdgeForCausalLM"),
+    "DoryForCausalLM": ("dory", "DoryForCausalLM"),
     "Ernie4_5ForCausalLM": ("ernie45", "Ernie4_5ForCausalLM"),
     "Ernie4_5_MoeForCausalLM": ("ernie45_moe", "Ernie4_5_MoeForCausalLM"),
     "ExaoneForCausalLM": ("exaone", "ExaoneForCausalLM"),
@@ -229,6 +230,7 @@ _EMBEDDING_MODELS = {
     "GteModel": ("bert_with_rope", "SnowflakeGteNewModel"),
     "GteNewModel": ("bert_with_rope", "GteNewModel"),
     "JinaEmbeddingsV5Model": ("jina", "JinaEmbeddingsV5Model"),
+    "Lfm2BidirectionalModel": ("lfm2", "Lfm2BidirectionalModel"),
     "LlamaBidirectionalModel": ("llama", "LlamaBidirectionalModel"),
     "LlamaModel": ("llama", "LlamaForCausalLM"),
     **{
@@ -783,6 +785,9 @@ _TRANSFORMERS_BACKEND_MODELS = {
     # Text generation models
     "TransformersForCausalLM": ("transformers", "TransformersForCausalLM"),
     "TransformersMoEForCausalLM": ("transformers", "TransformersMoEForCausalLM"),
+    # Multi-token prediction draft models
+    "TransformersForMTP": ("transformers", "TransformersForMTP"),
+    "TransformersMoEForMTP": ("transformers", "TransformersMoEForMTP"),
     # Multimodal models
     "TransformersMultiModalForCausalLM": (
         "transformers",

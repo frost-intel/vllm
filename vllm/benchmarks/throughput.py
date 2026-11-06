@@ -42,6 +42,9 @@ def run_vllm(
     disable_detokenize: bool = False,
     warmup_requests: list[SampleRequest] | None = None,
     prequeue_requests: bool = False,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+    top_k: int = -1,
 ) -> tuple[float, list[RequestOutput] | None]:
     from vllm import LLM
 
@@ -66,6 +69,7 @@ def run_vllm(
             do_profile=False,
             prequeue_requests=prequeue_requests,
             enable_lora=engine_args.enable_lora,
+            temperature=temperature, top_p=top_p, top_k=top_k,
         )
 
     return _run_vllm_requests(
@@ -76,6 +80,7 @@ def run_vllm(
         do_profile=do_profile,
         prequeue_requests=prequeue_requests,
         enable_lora=engine_args.enable_lora,
+        temperature=temperature, top_p=top_p, top_k=top_k,
     )
 
 
@@ -87,6 +92,9 @@ def _run_vllm_requests(
     do_profile: bool,
     prequeue_requests: bool,
     enable_lora: bool,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+    top_k: int = -1,
 ) -> tuple[float, list[RequestOutput] | None]:
     from vllm import SamplingParams
 
@@ -109,8 +117,9 @@ def _run_vllm_requests(
         sampling_params.append(
             SamplingParams(
                 n=n,
-                temperature=1.0,
-                top_p=1.0,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
                 ignore_eos=True,
                 max_tokens=request.expected_output_len,
                 detokenize=not disable_detokenize,
@@ -195,6 +204,9 @@ def run_vllm_chat(
     disable_detokenize: bool = False,
     warmup_requests: list[SampleRequest] | None = None,
     prequeue_requests: bool = False,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+    top_k: int = -1,
 ) -> tuple[float, list[RequestOutput]]:
     """Run vLLM chat benchmark. This function is recommended ONLY for benchmarking
     multimodal models as it properly handles multimodal inputs and chat
@@ -223,6 +235,7 @@ def run_vllm_chat(
             disable_detokenize,
             do_profile=False,
             prequeue_requests=prequeue_requests,
+            temperature=temperature, top_p=top_p, top_k=top_k,
         )
 
     return _run_vllm_chat_requests(
@@ -232,6 +245,7 @@ def run_vllm_chat(
         disable_detokenize,
         do_profile=do_profile,
         prequeue_requests=prequeue_requests,
+        temperature=temperature, top_p=top_p, top_k=top_k,
     )
 
 
@@ -242,6 +256,9 @@ def _run_vllm_chat_requests(
     disable_detokenize: bool,
     do_profile: bool,
     prequeue_requests: bool,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+    top_k: int = -1,
 ) -> tuple[float, list[RequestOutput]]:
     from vllm import SamplingParams
 
@@ -266,8 +283,9 @@ def _run_vllm_chat_requests(
         sampling_params.append(
             SamplingParams(
                 n=n,
-                temperature=1.0,
-                top_p=1.0,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
                 ignore_eos=True,
                 max_tokens=request.expected_output_len,
                 detokenize=not disable_detokenize,
@@ -304,6 +322,9 @@ async def run_vllm_async(
     do_profile: bool,
     disable_detokenize: bool = False,
     warmup_requests: list[SampleRequest] | None = None,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+    top_k: int = -1,
 ) -> float:
     from vllm.entrypoints.launchers.api_server.entry import (
         build_async_engine_client_from_engine_args,
@@ -332,6 +353,7 @@ async def run_vllm_async(
                 disable_detokenize,
                 do_profile=False,
                 request_id_prefix="warmup",
+                temperature=temperature, top_p=top_p, top_k=top_k,
             )
 
         elapsed_time, _ = await _run_vllm_async_requests(
@@ -341,6 +363,7 @@ async def run_vllm_async(
             disable_detokenize,
             do_profile=do_profile,
             request_id_prefix="test",
+            temperature=temperature, top_p=top_p, top_k=top_k,
         )
         return elapsed_time
 
@@ -352,6 +375,9 @@ async def _run_vllm_async_requests(
     disable_detokenize: bool,
     do_profile: bool,
     request_id_prefix: str,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+    top_k: int = -1,
 ) -> tuple[float, None]:
     from vllm import SamplingParams
 
@@ -374,8 +400,9 @@ async def _run_vllm_async_requests(
         sampling_params.append(
             SamplingParams(
                 n=n,
-                temperature=1.0,
-                top_p=1.0,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
                 ignore_eos=True,
                 max_tokens=request.expected_output_len,
                 detokenize=not disable_detokenize,
@@ -580,20 +607,28 @@ def get_requests(args, tokenizer):
     mm_backends = ("vllm", "vllm-chat")
     requests = get_samples(serve_args, tokenizer, multimodal_backends=mm_backends)
     requests = assign_loras(requests, args)
-    requests = filter_requests_for_dp(requests, args.data_parallel_size)
+    requests = filter_requests_for_dp(requests, args)
     return requests
 
 
-def filter_requests_for_dp(requests, data_parallel_size):
+def filter_requests_for_dp(requests, args):
     # Note(zhuohan): The way we get data_parallel_rank is hacky and only
     # works for external launcher mode. Should be cleaned up and deprecated
     # in the future with a better vLLM distributed process design.
+    data_parallel_size = args.data_parallel_size
     if data_parallel_size == 1:
         return requests
 
-    global_rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    data_parallel_rank = global_rank // (world_size // data_parallel_size)
+    from vllm.config.parallel import external_launcher_dp_rank
+
+    data_parallel_rank = external_launcher_dp_rank(
+        rank=int(os.environ["RANK"]),
+        world_size=int(os.environ["WORLD_SIZE"]),
+        data_parallel_size=data_parallel_size,
+        tensor_parallel_size=args.tensor_parallel_size,
+        prefill_context_parallel_size=getattr(args, "prefill_context_parallel_size", 1),
+        rank_layout=getattr(args, "rank_layout", "default"),
+    )
     return [
         r
         for i, r in enumerate(requests)
@@ -775,6 +810,18 @@ def validate_args(args):
 
 
 def add_cli_args(parser: FlexibleArgumentParser):
+    parser.add_argument(
+        "--temperature", type=float, default=1.0,
+        help="Sampling temperature for vLLM backends.",
+    )
+    parser.add_argument(
+        "--top-p", type=float, default=1.0,
+        help="Nucleus sampling probability for vLLM backends.",
+    )
+    parser.add_argument(
+        "--top-k", type=int, default=-1,
+        help="Top-k sampling limit for vLLM backends; -1 disables it.",
+    )
     parser.add_argument(
         "--backend",
         type=str,
@@ -1029,6 +1076,7 @@ def main(args: argparse.Namespace):
                     requests,
                     args.n,
                     AsyncEngineArgs.from_cli_args(args),
+                    temperature=args.temperature, top_p=args.top_p, top_k=args.top_k,
                     disable_detokenize=args.disable_detokenize,
                     do_profile=args.profile,
                     warmup_requests=warmup_requests,
@@ -1039,6 +1087,7 @@ def main(args: argparse.Namespace):
                 requests,
                 args.n,
                 EngineArgs.from_cli_args(args),
+                temperature=args.temperature, top_p=args.top_p, top_k=args.top_k,
                 disable_detokenize=args.disable_detokenize,
                 do_profile=args.profile,
                 warmup_requests=warmup_requests,
@@ -1065,6 +1114,7 @@ def main(args: argparse.Namespace):
             requests,
             args.n,
             EngineArgs.from_cli_args(args),
+            temperature=args.temperature, top_p=args.top_p, top_k=args.top_k,
             disable_detokenize=args.disable_detokenize,
             do_profile=args.profile,
             warmup_requests=warmup_requests,

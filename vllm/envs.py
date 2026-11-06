@@ -108,6 +108,7 @@ if TYPE_CHECKING:
     VERBOSE: bool = False
     VLLM_ALLOW_LONG_MAX_MODEL_LEN: bool = False
     VLLM_HTTP_TIMEOUT_KEEP_ALIVE: int = 5  # seconds
+    VLLM_HTTP_MAX_REQUEST_BODY_SIZE: int = 32 * 1024 * 1024  # bytes
     VLLM_MAX_N_SEQUENCES: int = 16384
     VLLM_MAX_COMPLETION_PROMPTS: int = 1024
     VLLM_MAX_STOP_STRINGS: int = 4
@@ -137,6 +138,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER: bool = False
     VLLM_ROCM_USE_AITER_CUSTOM_AR: bool = True
     VLLM_ROCM_MUSE_MOE_REDUCE_DTYPE: str = "fp32"
+    VLLM_ROCM_MUSE_MOE_ONLINE_QUANT: str = ""
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
     VLLM_ROCM_USE_AITER_MOE: bool = True
@@ -146,7 +148,6 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_RMSNORM: bool = True
     VLLM_ROCM_USE_AITER_MLA: bool = True
     VLLM_ROCM_AITER_MLA_ASM_PADDING: Literal["auto", "gluon", "asm"] = "auto"
-    VLLM_ROCM_AITER_MLA_DCP_VERIFY: Literal["auto", "asm", "segmented"] = "auto"
     VLLM_ROCM_USE_AITER_MHA: bool = True
     VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA: bool = False
     VLLM_ROCM_USE_AITER_TRITON_ROPE: bool = False
@@ -328,7 +329,9 @@ if TYPE_CHECKING:
     VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: bool = True
     VLLM_XPU_FORCE_N_CONTIG_WEIGHT: bool = False
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
+    VLLM_XPU_USE_SAMPLER_GRAPH: bool = False
     VLLM_XPU_INC_WNA16_BACKEND: Literal["auto", "ark", "w4a16", "w4a8"] = "auto"
+    VLLM_XPU_W8A16_BLOCK_FP8: bool | None = None
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
@@ -376,7 +379,7 @@ def disable_compile_cache() -> bool:
 
 
 def use_aot_compile() -> bool:
-    from vllm.utils.torch_utils import is_torch_equal_or_newer
+    from vllm.utils.torch_version import is_torch_equal_or_newer
 
     default_value = (
         "1"
@@ -388,7 +391,7 @@ def use_aot_compile() -> bool:
 
 
 def use_mega_aot_artifact():
-    from vllm.utils.torch_utils import is_torch_equal_or_newer
+    from vllm.utils.torch_version import is_torch_equal_or_newer
 
     default_value = (
         "1" if is_torch_equal_or_newer("2.12.0.dev") and use_aot_compile() else "0"
@@ -1134,6 +1137,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HTTP_TIMEOUT_KEEP_ALIVE": lambda: int(
         os.environ.get("VLLM_HTTP_TIMEOUT_KEEP_ALIVE", "5")
     ),
+    # Maximum request body size in bytes accepted by the HTTP API server; 0
+    # removes the limit. Only enforced by the Rust frontend; the Python
+    # frontend has no limit.
+    "VLLM_HTTP_MAX_REQUEST_BODY_SIZE": lambda: int(
+        os.environ.get("VLLM_HTTP_MAX_REQUEST_BODY_SIZE", str(32 * 1024 * 1024))
+    ),
     # Maximum allowed value for the `n` sampling parameter (number of output
     # sequences per request). Limits resource consumption to prevent
     # denial-of-service via excessively large fan-out. Default: 16384.
@@ -1269,6 +1278,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_MUSE_MOE_REDUCE_DTYPE": lambda: os.getenv(
         "VLLM_ROCM_MUSE_MOE_REDUCE_DTYPE", "fp32"
     ).lower(),
+    # Muse Spark on ROCm: online-quantize routed experts ("" or "mxfp4"; first
+    # and last layer stay BF16).
+    "VLLM_ROCM_MUSE_MOE_ONLINE_QUANT": lambda: os.getenv(
+        "VLLM_ROCM_MUSE_MOE_ONLINE_QUANT", ""
+    ).lower(),
     # use aiter linear op if aiter ops are enabled
     # The following list of related ops
     # - scaled_mm (per-tensor / rowwise)
@@ -1318,16 +1332,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_MLA": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_MLA", "True").lower() in ("true", "1")
-    ),
-    # Kernel for causal multi-token (spec-decode) verify steps under decode
-    # context parallelism: "asm" uses AITER's round-robin ASM decode (gfx950),
-    # "segmented" the Triton segmented MLA path. "auto" (default) takes "asm"
-    # wherever it can serve the shape and "segmented" otherwise.
-    "VLLM_ROCM_AITER_MLA_DCP_VERIFY": env_with_choices(
-        "VLLM_ROCM_AITER_MLA_DCP_VERIFY",
-        "auto",
-        ["auto", "asm", "segmented"],
-        case_sensitive=False,
     ),
     # Small-head (<16) AITER MLA decode kernel selection. Small head counts
     # (e.g. Kimi-K3: 12 heads/rank at TP8, 6 at TP16) can decode either through
@@ -2225,6 +2229,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_XPU_USE_SAMPLER_KERNEL": lambda: bool(
         int(os.getenv("VLLM_XPU_USE_SAMPLER_KERNEL", "1"))
     ),
+    "VLLM_XPU_USE_SAMPLER_GRAPH": lambda: bool(
+        int(os.getenv("VLLM_XPU_USE_SAMPLER_GRAPH", "0"))
+    ),
     # Kernel backend for INC weight-only intN (WNA16) linear layers on XPU.
     # "auto" keeps the default preference order (ARK when importable, else the
     # oneDNN w4a16 path). "ark" forces the auto_round_kernel backend, "w4a16"
@@ -2234,6 +2241,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Which one is fastest is device-dependent, so this is left as an opt-in.
     "VLLM_XPU_INC_WNA16_BACKEND": env_with_choices(
         "VLLM_XPU_INC_WNA16_BACKEND", "auto", ["auto", "ark", "w4a16", "w4a8"]
+    ),
+    # Route XPU block-scaled FP8 dense linear through the fused w8a16 GEMM.
+    # Unset: enabled on PVC (Data Center GPU Max) only. "0"/"1" forces it.
+    "VLLM_XPU_W8A16_BLOCK_FP8": lambda: maybe_convert_bool(
+        os.getenv("VLLM_XPU_W8A16_BLOCK_FP8")
     ),
     # Enable simple KV offload.
     "VLLM_USE_SIMPLE_KV_OFFLOAD": lambda: bool(
@@ -2403,6 +2415,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",
         "VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
+        "VLLM_HTTP_MAX_REQUEST_BODY_SIZE",
         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS",
         "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS",
         "VLLM_KEEP_ALIVE_ON_ENGINE_DEATH",
