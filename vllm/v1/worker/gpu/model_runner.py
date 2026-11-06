@@ -1129,7 +1129,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         ),
                     )
                     if (
-                        envs.VLLM_XPU_USE_SAMPLE_GRAPH
+                        envs.VLLM_XPU_USE_SAMPLER_GRAPH
                         and self.is_last_pp_rank
                         and self.sampler is not None
                     ):
@@ -1646,7 +1646,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             and input_batch.num_tokens == input_batch.num_reqs
             and input_batch.num_reqs > 0
             and input_batch.num_draft_tokens == 0
-            and self.dp_size == 1
             and not np.any(input_batch.idx_mapping_np < 0)
             and not np.any(input_batch.is_prefilling_np[: input_batch.num_reqs])
             and grammar_output is None
@@ -1702,7 +1701,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.device.type == "xpu"
             and envs.VLLM_XPU_USE_SAMPLER_GRAPH
             and self.is_last_pp_rank
-            and self.dp_size == 1
             and self.batch_sharder is None
             and self.speculator is None
             and self.pcp_manager is None
