@@ -2444,6 +2444,19 @@ class EngineArgs:
                 self.data_parallel_size_local = max(
                     local_world_size // world_size_within_dp, 1
                 )
+            dp_local = self.data_parallel_size_local
+            if (
+                not self.data_parallel_external_lb
+                and dp_local
+                and self.data_parallel_size % dp_local == 0
+                and self.nnodes % (self.data_parallel_size // dp_local) == 0
+            ):
+                # First DP rank of this node's node group. Same as the estimate
+                # above, except when several replicas each span the group's nodes.
+                nnodes_within_dp = self.nnodes // (self.data_parallel_size // dp_local)
+                inferred_data_parallel_rank = (
+                    self.node_rank // nnodes_within_dp
+                ) * dp_local
         data_parallel_external_lb = (
             self.data_parallel_external_lb or self.data_parallel_rank is not None
         )

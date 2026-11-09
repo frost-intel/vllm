@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import argparse
+import multiprocessing.connection
 import signal
 import time
 
@@ -9,6 +10,7 @@ import uvloop
 
 import vllm
 import vllm.envs as envs
+from vllm.config import VllmConfig
 from vllm.entrypoints.cli.types import CLISubcommand
 from vllm.entrypoints.common.cli_args import (
     make_arg_parser,
@@ -24,6 +26,7 @@ from vllm.reasoning import ReasoningParserManager
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.network_utils import get_tcp_uri
+from vllm.utils.system_utils import get_mp_context
 from vllm.v1.engine.utils import CoreEngineProcManager, launch_core_engines
 from vllm.v1.executor import Executor
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
@@ -178,6 +181,49 @@ def cmd_init() -> list[CLISubcommand]:
     return [ServeSubcommand()]
 
 
+def _run_headless_replica_shard(
+    vllm_config: VllmConfig, dp_rank: int, local_dp_rank: int
+) -> None:
+    """Run this node's workers of one DP replica of a multi-replica node group."""
+    parallel_config = vllm_config.parallel_config
+    parallel_config.data_parallel_rank = dp_rank
+    parallel_config.data_parallel_index = dp_rank
+    parallel_config.data_parallel_rank_local = local_dp_rank
+    executor = MultiprocExecutor(vllm_config, monitor_workers=False)
+    executor.start_worker_monitor(inline=True)
+
+
+def _run_headless_replica_shards(vllm_config: VllmConfig, local_count: int) -> None:
+    """Start this node's shard of every local DP replica, one process each.
+
+    The shards must start concurrently: each executor waits for its workers,
+    which wait for the whole world group to form.
+    """
+    start_rank = vllm_config.parallel_config.data_parallel_rank
+    context = get_mp_context()
+    procs = [
+        context.Process(
+            target=_run_headless_replica_shard,
+            args=(vllm_config, start_rank + i, i),
+            name=f"HeadlessExecutor_DP{start_rank + i}",
+        )
+        for i in range(local_count)
+    ]
+    for proc in procs:
+        proc.start()
+    try:
+        # Return when any shard exits; the replicas cannot run without it.
+        multiprocessing.connection.wait([proc.sentinel for proc in procs])
+    finally:
+        for proc in procs:
+            if proc.is_alive():
+                proc.terminate()
+        for proc in procs:
+            proc.join(timeout=10)
+            if proc.is_alive():
+                proc.kill()
+
+
 def run_headless(args: argparse.Namespace):
     if args.api_server_count > 1:
         raise ValueError("api_server_count can't be set in headless mode")
@@ -228,6 +274,9 @@ def run_headless(args: argparse.Namespace):
             head_node_address,
         )
 
+        if parallel_config.multi_replica_node_group:
+            _run_headless_replica_shards(vllm_config, local_engine_count)
+            return
         executor = MultiprocExecutor(vllm_config, monitor_workers=False)
         executor.start_worker_monitor(inline=True)
         return

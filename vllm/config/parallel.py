@@ -839,21 +839,41 @@ class ParallelConfig:
     def local_world_size(self) -> int:
         return self.world_size // self.nnodes_within_dp
 
+    @property
+    def multi_replica_node_group(self) -> bool:
+        """Whether several internal-LB DP replicas each span the same nodes.
+
+        E.g. ``--nnodes 2 --data-parallel-size 3 --data-parallel-size-local 3``
+        with TP4 x PP2: each replica puts one PP stage on each node, so each node
+        holds a ``local_world_size`` shard of every local replica and every PP
+        stage's EP group stays on one node.
+        """
+        return (
+            self.nnodes_within_dp > 1
+            and self.data_parallel_size_local > 1
+            and not self.data_parallel_external_lb
+        )
+
     def get_local_gpu_index(
         self, local_rank: int, dp_local_rank: int | None = None
     ) -> int:
         """Map a worker's local rank to its host-local logical GPU index."""
         if (
-            self.distributed_executor_backend not in ("ray", "external_launcher")
-            and self.data_parallel_backend != "ray"
-            and self.nnodes_within_dp == 1
+            self.distributed_executor_backend in ("ray", "external_launcher")
+            or self.data_parallel_backend == "ray"
         ):
+            return local_rank
+        if self.nnodes_within_dp == 1:
+            shard_size = self.world_size
+        elif self.multi_replica_node_group:
+            shard_size = self.local_world_size
+        else:
+            return local_rank
+        if dp_local_rank is None:
+            dp_local_rank = self.data_parallel_rank_local
             if dp_local_rank is None:
-                dp_local_rank = self.data_parallel_rank_local
-                if dp_local_rank is None:
-                    dp_local_rank = self.data_parallel_index
-            return local_rank + dp_local_rank * self.world_size
-        return local_rank
+                dp_local_rank = self.data_parallel_index
+        return local_rank + dp_local_rank * shard_size
 
     @staticmethod
     def has_unfinished_dp(dp_group: ProcessGroup, has_unfinished: bool) -> bool:

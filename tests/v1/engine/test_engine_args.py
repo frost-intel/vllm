@@ -227,3 +227,27 @@ def test_external_lb_infers_rank_for_multinode_replicas():
         vllm_config = engine_args.create_engine_config(UsageContext.OPENAI_API_SERVER)
 
     assert vllm_config.parallel_config.data_parallel_rank == 0
+
+
+@pytest.mark.parametrize("node_rank", [0, 1])
+def test_internal_lb_replicas_sharing_node_group_start_at_rank_zero(node_rank):
+    """With every replica spanning both nodes, both nodes host DP ranks 0-2."""
+    engine_args = EngineArgs(
+        model="facebook/opt-125m",
+        data_parallel_size=3,
+        data_parallel_size_local=3,
+        tensor_parallel_size=4,
+        pipeline_parallel_size=2,
+        nnodes=2,
+        node_rank=node_rank,
+    )
+
+    with patch.object(ModelConfig, "is_moe", new=property(lambda self: True)):
+        vllm_config = engine_args.create_engine_config(
+            UsageContext.OPENAI_API_SERVER, headless=node_rank > 0
+        )
+
+    parallel_config = vllm_config.parallel_config
+    assert parallel_config.data_parallel_rank == 0
+    assert parallel_config.node_rank_within_dp == node_rank
+    assert parallel_config.multi_replica_node_group

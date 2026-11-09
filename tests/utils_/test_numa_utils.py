@@ -46,6 +46,7 @@ def _make_config(**parallel_kwargs):
         distributed_executor_backend="mp",
         data_parallel_backend="mp",
         nnodes_within_dp=1,
+        multi_replica_node_group=False,
         data_parallel_rank_local=0,
         data_parallel_index=0,
         pipeline_parallel_size=1,
@@ -459,6 +460,25 @@ def test_pcp_worker_keeps_local_gpu_index_without_dp_offset(parallel_kwargs):
         data_parallel_rank_local=1,
         **parallel_kwargs,
     )
+    assert (
+        numa_utils._get_numactl_worker_args(vllm_config.parallel_config, local_rank=1)
+        == "--cpunodebind=1 --membind=1"
+    )
+
+
+def test_worker_numa_binding_for_replicas_sharing_node_group():
+    """Each node holds a local_world_size shard of every local DP replica."""
+    vllm_config = _make_config(
+        numa_bind=True,
+        numa_bind_nodes=[0] * 6 + [1] * 6,
+        tensor_parallel_size=4,
+        pipeline_parallel_size=2,
+        nnodes_within_dp=2,
+        multi_replica_node_group=True,
+        local_world_size=4,
+        data_parallel_rank_local=2,
+    )
+    # Replica 2's local rank 1 -> GPU index 2 * 4 + 1 = 9 (NUMA node 1).
     assert (
         numa_utils._get_numactl_worker_args(vllm_config.parallel_config, local_rank=1)
         == "--cpunodebind=1 --membind=1"

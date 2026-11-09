@@ -110,12 +110,17 @@ class XPUWorker(Worker):
             and (
                 parallel_config.data_parallel_external_lb
                 or parallel_config.nnodes_within_dp == 1
+                or parallel_config.multi_replica_node_group
             )
         ):
             dp_local_rank = parallel_config.data_parallel_rank_local
             if dp_local_rank is None:
                 dp_local_rank = parallel_config.data_parallel_index
             replica_world_size = parallel_config.world_size
+            if parallel_config.multi_replica_node_group:
+                # Each local replica spans the node group; this node holds one
+                # local_world_size shard of it.
+                replica_world_size = parallel_config.local_world_size
             visible_device_count = torch.accelerator.device_count()
 
             if parallel_config.data_parallel_external_lb:

@@ -1996,6 +1996,48 @@ def test_nnodes_within_dp_rejects_uneven_internal_lb(nnodes):
         _ = parallel_config.nnodes_within_dp
 
 
+@pytest.mark.parametrize("node_rank", [0, 1])
+def test_local_gpu_index_for_replicas_sharing_node_group(node_rank):
+    """DP3 x (TP4 x PP2) on 2 nodes, all 3 replicas local: every replica spans
+    both nodes, so each node holds a 4-rank shard of each replica."""
+    parallel_config = ParallelConfig(
+        tensor_parallel_size=4,
+        pipeline_parallel_size=2,
+        data_parallel_size=3,
+        data_parallel_size_local=3,
+        distributed_executor_backend="mp",
+        nnodes=2,
+        node_rank=node_rank,
+    )
+
+    assert parallel_config.nnodes_within_dp == 2
+    assert parallel_config.node_rank_within_dp == node_rank
+    assert parallel_config.local_world_size == 4
+    assert parallel_config.multi_replica_node_group
+    gpu_indices = [
+        parallel_config.get_local_gpu_index(local_rank, dp_local_rank=dp_local_rank)
+        for dp_local_rank in range(3)
+        for local_rank in range(4)
+    ]
+    assert gpu_indices == list(range(12))
+
+
+def test_local_gpu_index_unchanged_when_replica_spans_nodes_alone():
+    parallel_config = ParallelConfig(
+        tensor_parallel_size=8,
+        pipeline_parallel_size=2,
+        data_parallel_size=2,
+        data_parallel_size_local=1,
+        distributed_executor_backend="mp",
+        nnodes=4,
+        node_rank=1,
+    )
+
+    assert parallel_config.nnodes_within_dp == 2
+    assert not parallel_config.multi_replica_node_group
+    assert parallel_config.get_local_gpu_index(3, dp_local_rank=0) == 3
+
+
 def test_draft_model_enables_async_scheduling_by_default():
     parallel_config = ParallelConfig(distributed_executor_backend="uni")
     model_config = ModelConfig("Qwen/Qwen3-0.6B", max_model_len=2048)
