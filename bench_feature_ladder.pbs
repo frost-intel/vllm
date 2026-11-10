@@ -134,6 +134,10 @@ export VLLM_MOE_ROUTING_SIMULATION_STRATEGY=uniform_random
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export CCL_PROCESS_LAUNCHER=torchrun
 export OMP_NUM_THREADS=8
+# Node-local Triton cache: workers on both nodes compiling the same kernel into the shared
+# ~/.triton cache (NFS home) race (FileExistsError) and the engine hangs. vllm_external_wrap.sh
+# already does this for @ext ranks.
+export TRITON_CACHE_DIR=/tmp/triton_cache_$USER
 unset CCL_WORKER_AFFINITY                 # ptdev.env sets it for 12 ranks per node
 
 NODES=($(sort -u "$PBS_NODEFILE" | cut -d. -f1))
