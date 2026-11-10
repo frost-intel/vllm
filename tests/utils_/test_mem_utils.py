@@ -148,3 +148,64 @@ def test_memory_snapshot_uses_cuda_on_discrete_gpu():
         assert snapshot.free_memory == mock_cuda_free
         assert snapshot.total_memory == mock_cuda_total
         mock_psutil.virtual_memory.assert_not_called()
+
+
+def test_memory_profiling_waits_for_released_memory_on_xpu():
+    """Freed memory that returns to the device after empty_cache() (seen on XPU)
+    must not be counted as consumed: after_profile settles on the final value."""
+    gib = 1024**3
+    total = 64 * gib
+    # free memory right after the profile run, then the release arriving later
+    readings = iter([30 * gib, 30 * gib, 30 * gib, 39 * gib])
+    clock = {"t": 0.0}
+
+    def get_memory_info(device=None):
+        return next(readings, 39 * gib), total
+
+    def sleep(seconds):
+        clock["t"] += seconds
+
+    with (
+        patch("vllm.utils.mem_utils.current_platform") as mock_platform,
+        patch("torch.accelerator") as mock_accelerator,
+        patch("vllm.utils.mem_utils.time.monotonic", side_effect=lambda: clock["t"]),
+        patch("vllm.utils.mem_utils.time.sleep", side_effect=sleep),
+    ):
+        mock_platform.is_integrated_gpu.return_value = False
+        mock_platform.is_xpu.return_value = True
+        mock_accelerator.get_memory_info.side_effect = get_memory_info
+        mock_accelerator.memory_stats.return_value = {}
+        mock_accelerator.memory_reserved.return_value = 0
+
+        baseline = MemorySnapshot(device="xpu:0", auto_measure=False)
+        baseline.free_memory = 60 * gib
+        with memory_profiling(baseline) as result:
+            pass
+
+    mock_accelerator.synchronize.assert_called()
+    assert result.after_profile.free_memory == 39 * gib
+    assert result.total_consumed == 21 * gib
+    # stops once free memory has not grown for settle_s, well before the timeout
+    assert clock["t"] < 5.0
+
+
+def test_memory_profiling_does_not_wait_off_xpu():
+    gib = 1024**3
+    with (
+        patch("vllm.utils.mem_utils.current_platform") as mock_platform,
+        patch("torch.accelerator") as mock_accelerator,
+        patch("vllm.utils.mem_utils.time.sleep") as mock_sleep,
+    ):
+        mock_platform.is_integrated_gpu.return_value = False
+        mock_platform.is_xpu.return_value = False
+        mock_accelerator.get_memory_info.return_value = (30 * gib, 64 * gib)
+        mock_accelerator.memory_stats.return_value = {}
+        mock_accelerator.memory_reserved.return_value = 0
+
+        baseline = MemorySnapshot(device="cuda:0", auto_measure=False)
+        baseline.free_memory = 60 * gib
+        with memory_profiling(baseline) as result:
+            pass
+
+    mock_sleep.assert_not_called()
+    assert result.after_profile.free_memory == 30 * gib
