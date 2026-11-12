@@ -1,0 +1,409 @@
+#!/bin/bash
+#PBS -N vllm_feature_ladder
+#PBS -q aicoe
+#PBS -l select=2:ncpus=208
+#PBS -l place=scatter
+#PBS -l walltime=20:00:00
+#PBS -j oe
+#
+# DeepSeek-V3 FP8 on PVC: a cumulative "feature ladder". Each arm adds one optimization to
+# the previous one, so adjacent arms show that feature's gain and the first arm approximates
+# the baseline from a few months ago.
+#
+#   arm            adds                                       toggle
+#   baseline       Triton MLA + Triton MoE, W8A8 dense, eager --attention-backend TRITON_MLA
+#                                                             --moe-backend triton
+#                                                             VLLM_XPU_W8A16_BLOCK_FP8=0, --enforce-eager
+#   mla            XPU MLA decode kernel (vllm-xpu-kernels)   --attention-backend FLASH_ATTN_MLA
+#   grouped_gemm   XPU MoE grouped GEMM                       --moe-backend auto (picks XPU first on XPU)
+#   w8a16          fused W8A16 block-FP8 dense GEMM           VLLM_XPU_W8A16_BLOCK_FP8=1
+#   xpu_graph      XPU graphs                                 drop --enforce-eager, add
+#                                                             max_cudagraph_capture_size=CAPTURE_MAX (128)
+#   sampler_graph  captured logits+sampling graph             VLLM_XPU_USE_SAMPLER_GRAPH=1
+#   outer_pp       TP4 x PP2 x DP3 on all 24 tiles (2 nodes)  --data-parallel-size 3 --data-parallel-size-local 3
+#
+# Layout: 2 nodes run TP8 x PP2 (8 tiles per node); 1 node runs TP4 x PP3 (12 tiles).
+# For 1 node: qsub -l select=1:ncpus=208 ...
+#
+# Graph capture: --max-num-seqs is the largest concurrency (one process sweeps all of them),
+# which by default would capture graphs up to batch 512. Each step runs one PP microbatch,
+# and KV capacity keeps those well below 128 (~90 per microbatch for TP8 x PP2 at c512 with
+# random prompts), so graphs above 128 would never replay while taking KV memory (~25-30%
+# less KV in the 2-node runs). Larger batches, if any, run the compiled model without a
+# graph; nothing is recompiled during the sweep.
+#
+# Launchers: an arm may carry a suffix, e.g. baseline@ext. Arms without one use LAUNCHER.
+#   mp   mp executor (default). Node 0 runs bench_metrics.py (the leader: loads the model once
+#        and sweeps CONCURRENCIES); node 1 runs `vllm serve --headless`, which only hosts that
+#        node's workers. See bench_ladder_node.sh. Uses the V2 model runner and keeps both PP
+#        microbatches in flight.
+#   ext  external_launcher: mpiexec starts bench_metrics.py on every rank via
+#        vllm_external_wrap.sh. Falls back to the V1 model runner (V2 does not support PP with
+#        external_launcher) and runs one PP microbatch at a time; it measured ~1.9x slower for
+#        TP8 x PP2 in the 2026-11-06 launcher A/B. DP=1 arms only.
+#
+# Default run: the whole ladder in one job, so every arm runs on the same node pair. Arms run
+# in ladder order from baseline@mp ("vs base" in the summary is relative to the first arm),
+# then baseline@ext and xpu_graph@ext for the launcher comparison. Expect ~10-12 h (eager
+# and @ext arms are the slowest); each arm is capped at ARM_TIMEOUT. Repeats are separate jobs.
+#
+# KV cache: @mp arms size their KV cache automatically (one scheduler per replica sizes all
+# its workers together). @ext arms are pinned: every rank runs its own scheduler and the two
+# PP stages hold different numbers of layers, so the same free memory gives them different
+# block counts; once the cache fills, their schedulers diverge and the run hangs. Before
+# each @ext arm a short probe starts it with a tiny override, reads the block count every
+# rank logs, and the arm then runs with --num-gpu-blocks-override at the smallest. Set
+# KV_BLOCKS to skip the probe. The summary reports each arm's KV size (kv=tokens), since
+# arms that run out of KV cache at high concurrency are limited by capacity, not speed.
+#
+# spec_decode (DeepSeek MTP) is not in this ladder: it needs real weights and a dataset
+# with meaningful inputs (Spec-Bench via `vllm bench serve`), so it runs separately.
+#
+# Every arm uses the same sampling (SAMPLING below): the sampler graph only replays for
+# non-greedy requests with top-k/top-p set, so sampler_graph is the only change at its step.
+#
+# Caveats:
+#   * Prompts: bench_metrics.py sends the same repeated sentence to every request. Prefix
+#     caching is off (--no-enable-prefix-caching) so prefill and KV usage are real. Weights
+#     are dummy and MoE routing is simulated as uniform (VLLM_MOE_ROUTING_SIMULATION_STRATEGY),
+#     so the prompt text does not affect expert load. A standard vllm bench workload should
+#     eventually replace bench_metrics.py.
+#   * outer_pp needs vllm pvc_dev at or after d2c8f3fc42 ("Support internal-LB DP replicas
+#     that span the same nodes"): each replica puts PP stage 0 on node 0 and stage 1 on
+#     node 1, so every EP group is node-local, and node 1's `vllm serve --headless` starts
+#     that node's shard of all 3 replicas. The offline LLM class rejects DP > 1 with the mp
+#     executor, so bench_metrics.py uses AsyncLLM there (--engine auto); same measurement.
+#   * outer_pp sets CCL_SYCL_KERNEL_SYNC=0: uneven DP batches hit a oneCCL small-allgather
+#     corruption that shows up as GPU page faults (workaround verified in the oneCCL
+#     reproducer and 2 vLLM runs; untested without validation clamping).
+#   * outer_pp is a capacity feature: in the 2-node A/D runs (graph, 1000/1000) TP4xPP2xDP3
+#     matched TP8xPP2 at concurrency 32 and only pulled ahead (up to ~1.85x) at 256-512,
+#     where TP8xPP2 runs out of KV cache (~90 sequences). Each DP replica sizes its KV cache
+#     separately (65k-360k tokens seen); the smallest one limits D, so check the
+#     "XPU KV cache size" lines in run.log.
+#   * sampler_graph needs the V2 model runner (no effect with ext) and replays only when a
+#     PP microbatch's request count exactly matches a captured size (sizes <= 64). With all
+#     prompts submitted at once the two PP microbatches split unevenly (e.g. 1 + 15 at
+#     concurrency 16, 2 + 46 at 48), so it mostly replays for the small one.
+#
+# Usage:   qsub bench_feature_ladder.pbs
+#          qsub -v ARMS="w8a16@ext xpu_graph",CONCURRENCIES=32 bench_feature_ladder.pbs
+# Results: $OUT/summary.txt; per arm $OUT/<arm>/{run.log,engine_args.txt,bench_args.txt}.
+
+# ---- settings -------------------------------------------------------------------------
+VLLM_DIR=${VLLM_DIR:-/mnt/aimod/fmitchel/vllm}
+BENCH_SCRIPT=$VLLM_DIR/bench_metrics.py
+NODE_SCRIPT=$VLLM_DIR/bench_ladder_node.sh
+WRAP=$VLLM_DIR/vllm_external_wrap.sh       # external_launcher: sets RANK/LOCAL_RANK/CCL_LOCAL_* per rank
+AFFINITY=${AFFINITY:-/mnt/scratch/fmitchel/vllm/set_cpu-and-ccl-worker-affinity_aurora.sh}
+MODEL=${MODEL:-/mnt/aimod/aicoe/models/DeepSeek-V3/}
+OUT=${OUT:-/mnt/aimod/aicoe/phase1/vllm_results/feature_ladder_${PBS_JOBID%%.*}}
+
+ARMS=${ARMS:-"baseline@mp mla grouped_gemm w8a16 xpu_graph@mp sampler_graph outer_pp baseline@ext xpu_graph@ext"}
+LAUNCHER=${LAUNCHER:-mp}                 # for arms without an @mp/@ext suffix
+CONCURRENCIES=${CONCURRENCIES:-1,16,32,64,128,256,512}
+ISL=${ISL:-1000}
+OSL=${OSL:-1000}
+ARM_TIMEOUT=${ARM_TIMEOUT:-10800}         # seconds per arm (model init + full sweep): 3 h
+SAMPLING=(--temperature 0.8 --top-p 0.9 --top-k 50)
+BAD_NODES=(x1002c7s0b0n0)                 # Xe Link port-training failures; outer_pp GPU-faults there
+
+# ---- environment ----------------------------------------------------------------------
+saved_nodefile=$PBS_NODEFILE
+unset PBS_NODEFILE                        # ptdev.env runs `sudo cpupower` when this is set
+source /etc/profile >/dev/null 2>&1       # provides `module`, used by ptdev.env
+source /mnt/aimod/fmitchel/miniforge3/bin/activate
+source /mnt/aimod/fmitchel/envs/ptdev.env >/dev/null 2>&1
+export PBS_NODEFILE=$saved_nodefile
+set -uo pipefail
+
+export HF_HUB_OFFLINE=1
+export no_proxy=localhost,127.0.0.1
+# vllm-xpu-kernels build with device-resident sampler seeds (a5e07e1, "fused decode graph");
+# the env's installed wheel (g793fc19) fails sampler-graph capture ("seeds tensor must be on CPU").
+KERNELS=${KERNELS:-/mnt/aimod/aicoe/phase1/stack/vllm_xpu_kernels_a5e07e1}
+export PYTHONPATH=$KERNELS${PYTHONPATH:+:$PYTHONPATH}
+# Level Zero v2 adapter for every arm: with v1, XPU graphs with PP hung or ran out of KV memory
+# (2026-11-09, mp launcher), and in eager mode v2 matched or beat v1 (0-13%, TP8xPP2 and outer_pp).
+export SYCL_UR_USE_LEVEL_ZERO_V2=1
+# CCL_SYCL_KERNEL_SYNC=0 (oneCCL small-allgather corruption workaround) is set per arm in
+# run_arm, only for DP>1.
+# Dummy weights route tokens unevenly; simulate uniform MoE routing. Unset for real weights.
+export VLLM_MOE_ROUTING_SIMULATION_STRATEGY=uniform_random
+# mp executor workers; oneCCL takes the local rank/size the way torchrun provides them.
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export CCL_PROCESS_LAUNCHER=torchrun
+export OMP_NUM_THREADS=8
+# Node-local Triton cache: workers on both nodes compiling the same kernel into the shared
+# ~/.triton cache (NFS home) race (FileExistsError) and the engine hangs. vllm_external_wrap.sh
+# already does this for @ext ranks.
+export TRITON_CACHE_DIR=/tmp/triton_cache_$USER
+unset CCL_WORKER_AFFINITY                 # ptdev.env sets it for 12 ranks per node
+
+NODES=($(sort -u "$PBS_NODEFILE" | cut -d. -f1))
+for node in "${NODES[@]}"; do
+  if [[ " ${BAD_NODES[*]} " == *" $node "* ]]; then
+    echo "ABORT: allocated known-bad node $node; resubmit"
+    exit 3
+  fi
+done
+MASTER_ADDR=$(getent hosts "$(hostname -f | sed 's/hostmgmt/hsn/')" | awk '{print $1; exit}')
+# The prompts in bench_metrics.py tokenize to roughly 1.1 tokens per requested input token.
+MAX_MODEL_LEN=$((ISL * 3 / 2 + OSL))
+MAX_NUM_SEQS=$(tr ',' '\n' <<< "$CONCURRENCIES" | sort -n | tail -1)
+KV_BLOCKS=${KV_BLOCKS:-}                  # @ext KV blocks; empty = probe each @ext arm
+PROBE_TIMEOUT=${PROBE_TIMEOUT:-1800}      # seconds to wait for every rank's block count
+CAPTURE_MAX=${CAPTURE_MAX:-128}           # largest graph capture size (graph arms); see header
+
+mkdir -p "$OUT"
+cd "$VLLM_DIR"
+{
+  echo "job=$PBS_JOBID start=$(date -Is) nodes=${NODES[*]} master=$MASTER_ADDR"
+  echo "vllm $(git --no-optional-locks rev-parse --short HEAD) ($(git --no-optional-locks branch --show-current))"
+  git --no-optional-locks status --porcelain -uno | sed 's/^/  modified: /'
+  python -c 'import importlib.metadata as m, vllm_xpu_kernels as k
+print("vllm-xpu-kernels", m.version("vllm_xpu_kernels"), k.__file__)' 2>&1 | tail -1
+  python -c 'import torch; print("torch", torch.__version__)' 2>&1 | tail -1
+  echo "modules: $(module -t list 2>&1 | tr '\n' ' ')"
+  echo "workload: ISL=$ISL OSL=$OSL concurrencies=$CONCURRENCIES sampling=${SAMPLING[*]}"
+  echo "arms: $ARMS (default launcher $LAUNCHER) ext kv_blocks=${KV_BLOCKS:-probe}"
+} > "$OUT/manifest.txt"
+git --no-optional-locks diff HEAD > "$OUT/vllm_local_changes.patch"
+
+# ---- arms ----------------------------------------------------------------------------
+LADDER=(baseline mla grouped_gemm w8a16 xpu_graph sampler_graph outer_pp)
+
+# arm_config <arm>[@mp|@ext]: start from the baseline and apply every step up to and
+# including <arm>; sets the layout, toggles and ARM_LAUNCHER.
+arm_config() {
+  local name=${1%@*} step
+  ARM_LAUNCHER=$LAUNCHER
+  [[ $1 == *@* ]] && ARM_LAUNCHER=${1#*@}
+  if ((${#NODES[@]} == 1)); then TP=4 PP=3; else TP=8 PP=2; fi
+  DP=1
+  ATTENTION=TRITON_MLA
+  MOE=triton
+  EAGER=1
+  W8A16=0
+  CAPTURE_SIZE=""
+  SAMPLER_GRAPH=0
+  for step in "${LADDER[@]}"; do
+    case $step in
+      mla)            ATTENTION=FLASH_ATTN_MLA ;;
+      grouped_gemm)   MOE=auto ;;          # FP8 MoE rejects 'xpu'; auto picks XPU first
+      w8a16)          W8A16=1 ;;
+      xpu_graph)      EAGER=0 ;;
+      sampler_graph)  SAMPLER_GRAPH=1 ;;
+      outer_pp)       TP=4 DP=3 ;;
+    esac
+    [[ $step == "$name" ]] && break
+  done
+  if [[ $step != "$name" ]]; then
+    echo "unknown arm: $1" >&2; return 1
+  fi
+  if [[ $ARM_LAUNCHER != mp && $ARM_LAUNCHER != ext ]]; then
+    echo "unknown launcher in $1 (use @mp or @ext)" >&2; return 1
+  fi
+  if ((DP > 1)) && [[ ${#NODES[@]} != 2 || $ARM_LAUNCHER != mp ]]; then
+    echo "skipping $1: outer_pp needs 2 nodes and the mp launcher" >&2; return 1
+  fi
+  if ((!EAGER)); then
+    CAPTURE_SIZE=$CAPTURE_MAX
+  fi
+}
+
+# placement: which tiles each node uses and the NUMA node of each (tiles 0-5 socket 0, 6-11 socket 1).
+placement() {
+  RANKS_PER_NODE=$((TP * PP * DP / ${#NODES[@]}))
+  if ((RANKS_PER_NODE == 8)); then
+    TILES=0,1,2,3,6,7,8,9
+    NUMA_NODES=(0 0 0 0 1 1 1 1)
+  else
+    TILES=0,1,2,3,4,5,6,7,8,9,10,11
+    NUMA_NODES=(0 0 0 0 0 0 1 1 1 1 1 1)
+  fi
+}
+
+# write_arm_args <dir>: one argument per line, read back by bench_ladder_node.sh.
+write_arm_args() {
+  local engine=(
+    --model "$MODEL"
+    --load-format dummy
+    --tensor-parallel-size "$TP"
+    --pipeline-parallel-size "$PP"
+    --enable-expert-parallel
+    --max-model-len "$MAX_MODEL_LEN"
+    --max-num-seqs "$MAX_NUM_SEQS"
+    --max-num-batched-tokens 8192
+    --gpu-memory-utilization 0.9
+    # bench_metrics.py sends the same prompt to every request; with prefix caching on, ~95% of
+    # prompt tokens hit the cache (prefill nearly free, prompt KV shared across requests).
+    --no-enable-prefix-caching
+    --attention-backend "$ATTENTION"
+    --moe-backend "$MOE"
+  )
+  if [[ $ARM_LAUNCHER == mp ]]; then
+    engine+=(
+      --distributed-executor-backend mp
+      --nnodes "${#NODES[@]}"
+      --master-addr "$MASTER_ADDR"
+      --master-port "$MASTER_PORT"
+      --numa-bind
+      --numa-bind-nodes "${NUMA_NODES[@]}"
+    )
+  else
+    # CPU and NUMA binding come from mpiexec --cpu-bind and numactl in launch_arm.
+    engine+=(--distributed-executor-backend external_launcher)
+    engine+=(--num-gpu-blocks-override "$ARM_KV_BLOCKS")
+  fi
+  if ((EAGER)); then
+    engine+=(--enforce-eager)
+  fi
+  if [[ -n $CAPTURE_SIZE ]]; then
+    engine+=(--compilation-config "{\"max_cudagraph_capture_size\": $CAPTURE_SIZE}")
+  fi
+  if ((DP > 1)); then
+    engine+=(--data-parallel-size "$DP" --data-parallel-size-local "$DP")
+  fi
+  local bench=(
+    --concurrencies "$CONCURRENCIES"
+    --input-len "$ISL"
+    --output-len "$OSL"
+    "${SAMPLING[@]}"
+  )
+  printf '%s\n' "${engine[@]}" > "$1/engine_args.txt"
+  printf '%s\n' "${bench[@]}" > "$1/bench_args.txt"
+}
+
+stop_leftovers() {
+  local node
+  for node in "${NODES[@]}"; do
+    # The [x] patterns keep pkill from matching its own ssh command line.
+    ssh -n "$node" 'pkill -9 -u $USER -f "[V]LLM::|[v]llm serve|[b]ench_metrics.py"'
+  done
+  sleep 30                                # device memory is freed only after the processes exit
+}
+
+# launch_arm <logfile>: run the current arm's args (written by write_arm_args) to <logfile>.
+launch_arm() {
+  (
+    export ARM_DIR=$dir BENCH_SCRIPT
+    export ZE_AFFINITY_MASK=$TILES LOCAL_WORLD_SIZE=$RANKS_PER_NODE
+    export VLLM_XPU_W8A16_BLOCK_FP8=$W8A16 VLLM_XPU_USE_SAMPLER_GRAPH=$SAMPLER_GRAPH
+    ((DP > 1)) && export CCL_SYCL_KERNEL_SYNC=0
+    if [[ $ARM_LAUNCHER == mp ]]; then
+      timeout -s KILL "$ARM_TIMEOUT" \
+        mpiexec --cpu-bind none -n "${#NODES[@]}" -ppn 1 bash "$NODE_SCRIPT"
+    else
+      # One process per rank. The affinity script sets CPU_BIND (one CPU list per local
+      # rank) and CCL_WORKER_AFFINITY; numactl binds memory to each tile's socket.
+      local ranks=$((TP * PP * DP))
+      source "$AFFINITY" "$RANKS_PER_NODE" > /dev/null 2>&1
+      export MASTER_ADDR MASTER_PORT NUMA_LIST="${NUMA_NODES[*]}"
+      local cmd='nodes=($NUMA_LIST)
+        mapfile -t E < "$ARM_DIR/engine_args.txt"; mapfile -t B < "$ARM_DIR/bench_args.txt"
+        exec numactl --membind="${nodes[$LOCAL_RANK]}" python "$BENCH_SCRIPT" "${E[@]}" "${B[@]}"'
+      timeout -s KILL "$ARM_TIMEOUT" \
+        mpiexec --cpu-bind="$CPU_BIND" -n "$ranks" -ppn "$RANKS_PER_NODE" \
+        -env PALS_WORLD_SIZE="$ranks" bash "$WRAP" bash -c "$cmd"
+    fi
+  ) < /dev/null > "$1" 2>&1
+}
+
+# probe_kv_blocks: start the @ext arm with a tiny override until every rank has logged its
+# own block count, stop it, and print the smallest count (empty on failure).
+probe_kv_blocks() {
+  local ranks=$((TP * PP * DP)) pid n t
+  ARM_KV_BLOCKS=64
+  write_arm_args "$dir"
+  launch_arm "$dir/probe.log" &
+  pid=$!
+  for ((t = 0; t < PROBE_TIMEOUT; t += 10)); do
+    sleep 10
+    n=$(grep -c "Overriding num_gpu_blocks=" "$dir/probe.log" 2>/dev/null)
+    ((${n:-0} >= ranks)) && break
+    kill -0 $pid 2>/dev/null || break
+  done
+  stop_leftovers > /dev/null 2>&1
+  kill $pid 2>/dev/null; wait $pid 2>/dev/null
+  grep -oE "Overriding num_gpu_blocks=[0-9]+" "$dir/probe.log" | grep -oE "[0-9]+$" | sort -n | head -1
+}
+
+run_arm() { # run_arm <arm>
+  dir=$OUT/$1
+  mkdir -p "$dir"
+  rm -f "$dir/leader.done"
+  MASTER_PORT=$((29500 + RANDOM % 2000))
+  placement
+  ARM_KV_BLOCKS=""
+  if [[ $ARM_LAUNCHER == ext ]]; then
+    ARM_KV_BLOCKS=${KV_BLOCKS:-$(probe_kv_blocks)}
+    if [[ -z $ARM_KV_BLOCKS ]]; then
+      echo "### $1 KV probe failed; see $dir/probe.log"
+      return
+    fi
+    echo "    $1 KV blocks per rank: $(grep -oE "Overriding num_gpu_blocks=[0-9]+" \
+      "$dir/probe.log" 2>/dev/null | grep -oE "[0-9]+$" | sort -n | uniq -c | tr -s ' \n' ' ')-> pin $ARM_KV_BLOCKS"
+    MASTER_PORT=$((29500 + RANDOM % 2000))
+  fi
+  write_arm_args "$dir"
+  echo "### $1 launcher=$ARM_LAUNCHER TP=$TP PP=$PP DP=$DP tiles=$TILES W8A16=$W8A16" \
+    "SAMPLER_GRAPH=$SAMPLER_GRAPH capture=${CAPTURE_SIZE:-default} kv_blocks=${ARM_KV_BLOCKS:-auto}" \
+    "start=$(date +%T)"
+  launch_arm "$dir/run.log"
+  echo "    rc=$? end=$(date +%T)"
+  stop_leftovers
+}
+
+for arm in $ARMS; do
+  arm_config "$arm" && run_arm "$arm"
+done
+
+# ---- summary --------------------------------------------------------------------------
+python - "$OUT" "$OSL" $ARMS <<'EOF' | tee "$OUT/summary.txt"
+import re
+import sys
+from pathlib import Path
+
+out, osl, arms = Path(sys.argv[1]), int(sys.argv[2]), sys.argv[3:]
+
+# vLLM falls back silently, so report what actually ran: (pattern, label) in priority order.
+PROBES = {
+    "runner": [(r"Using V2 Model Runner", "V2"), (r"", "V1")],
+    "attn": [(r"Using Triton MLA backend|TRITON_MLA", "triton"), (r"FLASH_ATTN_MLA|MLA backend on XPU", "xpu")],
+    "moe": [(r"Using XPU Fp8 MoE backend", "xpu"), (r"Using TRITON Fp8 MoE backend", "triton")],
+}
+
+def what_ran(log):
+    return {key: next((label for pat, label in pats if re.search(pat, log)), "?")
+            for key, pats in PROBES.items()}
+
+baseline = {}
+print(f"{'arm':15s} {'conc':>4s} {'TTFT s':>8s} {'TPOT ms':>8s} {'tok/s':>9s} {'vs base':>7s}  ran")
+for arm in arms:
+    log_path = out / arm / "run.log"
+    log = log_path.read_text(errors="ignore") if log_path.exists() else ""
+    ran = what_ran(log)
+    kv = sorted(int(x.replace(",", "")) for x in
+                re.findall(r"KV cache size: ([0-9,]+) tokens", log))
+    ran_str = (f"runner={ran['runner']} attn={ran['attn']} moe={ran['moe']} "
+               f"kv={kv[0] if kv else '?'}")
+    # external_launcher runs bench_metrics.py on every rank; keep rank 0's (first) line.
+    rows = {}
+    for line in log.splitlines():
+        if line.startswith("RESULT "):
+            r = dict(kv.split("=", 1) for kv in line.split()[1:] if "=" in kv)
+            rows.setdefault(int(r["concurrency"]), r)
+    rows = list(rows.values())
+    if not rows:
+        status = "GPU fault" if "Segmentation fault from GPU" in log else "no RESULT lines"
+        print(f"{arm:15s} {'-':>4s} {status}  {ran_str}")
+        continue
+    for r in rows:
+        conc, tps = int(r["concurrency"]), float(r["throughput_tok_s"])
+        baseline.setdefault(conc, tps)
+        short = "" if int(r["total_out_tokens"]) == conc * osl else "  SHORT OUTPUT"
+        print(f"{arm:15s} {conc:4d} {float(r['TTFT_s']):8.3f} {float(r['TPOT_ms']):8.2f} "
+              f"{tps:9.1f} {tps / baseline[conc]:6.2f}x  {ran_str}{short}")
+EOF
+echo "### done $(date -Is) results in $OUT"

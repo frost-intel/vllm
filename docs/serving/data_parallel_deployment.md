@@ -59,6 +59,19 @@ vllm serve $MODEL --headless --data-parallel-size 4 --data-parallel-size-local 4
                   --data-parallel-address 10.99.48.128 --data-parallel-rpc-port 13345
 ```
 
+With `--nnodes`, several DP replicas can each span the same group of nodes. This will run DP=3 x TP=4 x PP=2 with expert parallelism on two 12-GPU nodes: each replica puts pipeline stage 0 on node 0 and stage 1 on node 1, so every expert-parallel group (all DP x TP ranks of one stage) stays on one node and only pipeline traffic crosses nodes:
+
+```bash
+# Node 0  (with ip address 10.99.48.128)
+vllm serve $MODEL --tensor-parallel-size 4 --pipeline-parallel-size 2 \
+                  --data-parallel-size 3 --data-parallel-size-local 3 --enable-expert-parallel \
+                  --nnodes 2 --node-rank 0 --master-addr 10.99.48.128
+# Node 1
+vllm serve $MODEL --tensor-parallel-size 4 --pipeline-parallel-size 2 \
+                  --data-parallel-size 3 --data-parallel-size-local 3 --enable-expert-parallel \
+                  --nnodes 2 --node-rank 1 --master-addr 10.99.48.128 --headless
+```
+
 This DP mode can also be used with Ray by specifying `--data-parallel-backend=ray`:
 
 ```bash

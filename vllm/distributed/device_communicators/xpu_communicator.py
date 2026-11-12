@@ -133,10 +133,11 @@ class XpuCommunicator(DeviceCommunicatorBase):
             output.copy_(reduced.narrow(0, start, chunk_size))
         elif sizes is None or sizes.count(sizes[0]) == len(sizes):
             dist.reduce_scatter_tensor(output, input_tensor, group=self.device_group)
-        elif torch.xpu.device_count() < self.world_size:
-            # uneven reduce_scatter is not supported when the
-            # process cannot see every device in the group (
-            # e.g. external-LBDP).
+        else:
+            # Pad to an even reduce_scatter. XCCL lowers uneven reduce_scatter
+            # to one grouped reduce per rank, which is slower, and is not
+            # supported when the process cannot see every device in the group
+            # (e.g. external-LB DP).
             max_size = max(sizes)
             padded = input_tensor.new_zeros(
                 (world_size * max_size,) + input_tensor.shape[1:]
@@ -146,9 +147,6 @@ class XpuCommunicator(DeviceCommunicatorBase):
             padded_output = input_tensor.new_empty((max_size,) + input_tensor.shape[1:])
             dist.reduce_scatter_tensor(padded_output, padded, group=self.device_group)
             output = padded_output[:chunk_size]
-        else:
-            input_splits = list(input_tensor.split(sizes, dim=0))
-            dist.reduce_scatter(output, input_splits, group=self.device_group)
         # Reshape before returning
         return output.movedim(0, dim).contiguous()
 
@@ -174,28 +172,31 @@ class XpuCommunicator(DeviceCommunicatorBase):
                 assert input_.shape[dim] == sizes[self.rank_in_group], (
                     f"{input_.shape[dim]} != {sizes[self.rank_in_group]}"
                 )
-                output_size = (sum(sizes),) + input_size[1:]
-            else:
-                output_size = (input_size[0] * world_size,) + input_size[1:]
+                # Pad to an even all_gather and slice the result. XCCL lowers
+                # all_gather into unequal tensors to one grouped broadcast per
+                # rank, which is slower.
+                max_size = max(sizes)
+                padded = input_
+                if input_size[0] < max_size:
+                    padded = input_.new_empty((max_size,) + input_size[1:])
+                    padded[: input_size[0]].copy_(input_)
+                gathered = input_.new_empty((world_size * max_size,) + input_size[1:])
+                dist.all_gather_into_tensor(
+                    gathered, padded.contiguous(), group=self.device_group
+                )
+                return torch.cat(
+                    [
+                        gathered[rank * max_size : rank * max_size + size]
+                        for rank, size in enumerate(sizes)
+                    ],
+                    dim=0,
+                )
+            output_size = (input_size[0] * world_size,) + input_size[1:]
             # Allocate output tensor.
             output_tensor = torch.empty(
                 output_size, dtype=input_.dtype, device=input_.device
             )
-
-            if sizes is not None:
-                all_gather_list = []
-                for size in sizes:
-                    all_gather_list.append(
-                        torch.empty(
-                            (size,) + input_.shape[1:],
-                            dtype=input_.dtype,
-                            device=input_.device,
-                        )
-                    )
-                dist.all_gather(all_gather_list, input_, group=self.device_group)
-                output_tensor = torch.cat(all_gather_list, dim=0)
-            else:
-                dist.all_gather([output_tensor], input_, group=self.device_group)
+            dist.all_gather([output_tensor], input_, group=self.device_group)
             return output_tensor
 
         if isinstance(input_, torch.Tensor):

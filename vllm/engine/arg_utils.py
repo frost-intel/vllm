@@ -465,6 +465,12 @@ _MAMBA_CACHE_MODE_DEPRECATION_MESSAGE = (
 )
 
 
+_IR_OP_PRIORITY_DEPRECATION_MESSAGE = (
+    "ir_op_priority (--ir-op-priority) is deprecated because vLLM IR is being "
+    "removed. It will be removed in v0.34.0."
+)
+
+
 _DISABLE_CASCADE_ATTN_DEPRECATION_MESSAGE = (
     "--disable-cascade-attn is deprecated and has no effect since cascade "
     "attention has been removed. It will be removed in v0.33.0."
@@ -2438,6 +2444,19 @@ class EngineArgs:
                 self.data_parallel_size_local = max(
                     local_world_size // world_size_within_dp, 1
                 )
+            dp_local = self.data_parallel_size_local
+            if (
+                not self.data_parallel_external_lb
+                and dp_local
+                and self.data_parallel_size % dp_local == 0
+                and self.nnodes % (self.data_parallel_size // dp_local) == 0
+            ):
+                # First DP rank of this node's node group. Same as the estimate
+                # above, except when several replicas each span the group's nodes.
+                nnodes_within_dp = self.nnodes // (self.data_parallel_size // dp_local)
+                inferred_data_parallel_rank = (
+                    self.node_rank // nnodes_within_dp
+                ) * dp_local
         data_parallel_external_lb = (
             self.data_parallel_external_lb or self.data_parallel_rank is not None
         )
@@ -2813,6 +2832,8 @@ class EngineArgs:
 
             # Set the attribute
             setattr(kernel_config.ir_op_priority, op_name, op_priority)
+        if any(asdict(kernel_config.ir_op_priority).values()):
+            logger.warning_once(_IR_OP_PRIORITY_DEPRECATION_MESSAGE)
 
         load_config = self.create_load_config()
 

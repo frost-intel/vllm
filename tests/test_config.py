@@ -293,6 +293,7 @@ def test_lora_rejected_at_config_time_for_unsupported_model(supported):
     """Models without SupportsLoRA must fail during config validation with a
     clear message, not with a bare assert inside the model constructor."""
     model_config = SimpleNamespace(
+        runner_type="generate",
         is_lora_supported=supported,
         architecture="Zamba2ForCausalLM",
         architectures=["Zamba2ForCausalLM"],
@@ -307,6 +308,22 @@ def test_lora_rejected_at_config_time_for_unsupported_model(supported):
             ValueError, match="LoRA is not supported for Zamba2ForCausalLM"
         ):
             lora_config.verify_with_model_config(model_config)
+
+
+def test_lora_allowed_for_drafter_without_lora_support():
+    """Speculative decoding re-validates the config with the draft model's
+    config, and drafters don't run LoRA adapters."""
+    draft_config = SimpleNamespace(
+        runner_type="draft",
+        is_lora_supported=False,
+        architecture="DeepSeekMTPModel",
+        architectures=["DeepSeekMTPModel"],
+        model="deepseek-ai/DeepSeek-V3",
+        dtype=torch.bfloat16,
+    )
+    lora_config = LoRAConfig()
+    lora_config.verify_with_model_config(draft_config)
+    assert lora_config.lora_dtype == torch.bfloat16
 
 
 def test_mamba_cache_mode_all_is_rejected():
@@ -390,11 +407,9 @@ def test_pd_dcp_interleave_size_is_adjusted_to_block_size(
         kv_transfer_config=kv_transfer_config,
     )
 
-    kv_cache_config = SimpleNamespace(
-        kv_cache_groups=[SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16))]
-    )
+    kv_cache_groups = [SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16))]
     with caplog.at_level(logging.INFO):
-        config.adjust_dcp_kv_cache_interleave_size(kv_cache_config)
+        config.adjust_dcp_kv_cache_interleave_size(kv_cache_groups)
 
     assert config.parallel_config.cp_kv_cache_interleave_size == 16
     assert "automatically adjusted from 3 to block_size 16" in caplog.text
@@ -416,10 +431,26 @@ def test_kv_offloading_does_not_adjust_dcp_interleave_size():
         ),
     )
 
-    kv_cache_config = SimpleNamespace(
-        kv_cache_groups=[SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16))]
+    kv_cache_groups = [SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16))]
+    config.adjust_dcp_kv_cache_interleave_size(kv_cache_groups)
+
+    assert config.parallel_config.cp_kv_cache_interleave_size == 1
+
+
+def test_empty_kv_cache_groups_preserve_dcp_interleave_size():
+    config = VllmConfig(
+        device_config=DeviceConfig(device="cpu"),
+        parallel_config=ParallelConfig(
+            tensor_parallel_size=2,
+            decode_context_parallel_size=2,
+            distributed_executor_backend="mp",
+        ),
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="NixlConnector", kv_role="kv_both"
+        ),
     )
-    config.adjust_dcp_kv_cache_interleave_size(kv_cache_config)
+
+    config.adjust_dcp_kv_cache_interleave_size([])
 
     assert config.parallel_config.cp_kv_cache_interleave_size == 1
 
@@ -1963,6 +1994,48 @@ def test_nnodes_within_dp_rejects_uneven_internal_lb(nnodes):
 
     with pytest.raises(ValueError, match="Invalid data parallel configuration"):
         _ = parallel_config.nnodes_within_dp
+
+
+@pytest.mark.parametrize("node_rank", [0, 1])
+def test_local_gpu_index_for_replicas_sharing_node_group(node_rank):
+    """DP3 x (TP4 x PP2) on 2 nodes, all 3 replicas local: every replica spans
+    both nodes, so each node holds a 4-rank shard of each replica."""
+    parallel_config = ParallelConfig(
+        tensor_parallel_size=4,
+        pipeline_parallel_size=2,
+        data_parallel_size=3,
+        data_parallel_size_local=3,
+        distributed_executor_backend="mp",
+        nnodes=2,
+        node_rank=node_rank,
+    )
+
+    assert parallel_config.nnodes_within_dp == 2
+    assert parallel_config.node_rank_within_dp == node_rank
+    assert parallel_config.local_world_size == 4
+    assert parallel_config.multi_replica_node_group
+    gpu_indices = [
+        parallel_config.get_local_gpu_index(local_rank, dp_local_rank=dp_local_rank)
+        for dp_local_rank in range(3)
+        for local_rank in range(4)
+    ]
+    assert gpu_indices == list(range(12))
+
+
+def test_local_gpu_index_unchanged_when_replica_spans_nodes_alone():
+    parallel_config = ParallelConfig(
+        tensor_parallel_size=8,
+        pipeline_parallel_size=2,
+        data_parallel_size=2,
+        data_parallel_size_local=1,
+        distributed_executor_backend="mp",
+        nnodes=4,
+        node_rank=1,
+    )
+
+    assert parallel_config.nnodes_within_dp == 2
+    assert not parallel_config.multi_replica_node_group
+    assert parallel_config.get_local_gpu_index(3, dp_local_rank=0) == 3
 
 
 def test_draft_model_enables_async_scheduling_by_default():
@@ -3984,6 +4057,7 @@ def test_mtp_draft_uses_model_weights_not_local_cache(mock_model_config_cls):
     target_config.hf_text_config.model_type = "deepseek_v3"
     target_config.quantization = None
     target_config.max_model_len = 4096
+    target_config.using_transformers_backend.return_value = False
 
     SpeculativeConfig(
         method="mtp",

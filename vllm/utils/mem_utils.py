@@ -226,6 +226,30 @@ class MemoryProfilingResult:
         )
 
 
+def _wait_for_released_memory(
+    snapshot: MemorySnapshot,
+    settle_s: float = 1.0,
+    timeout_s: float = 5.0,
+    poll_s: float = 0.1,
+) -> None:
+    """Re-measure `snapshot` until the device's free memory stops increasing.
+
+    On XPU, memory freed by empty_cache() can return to the device up to ~1 s
+    later, and on a random subset of workers. Measured too early, the profile
+    run's activations are counted both as consumed memory and as peak headroom,
+    which shrinks that worker's KV cache (and, as engines take the minimum over
+    their workers, the whole engine's).
+    """
+    deadline = time.monotonic() + timeout_s
+    last_increase = time.monotonic()
+    while time.monotonic() < deadline and time.monotonic() - last_increase < settle_s:
+        time.sleep(poll_s)
+        previous_free = snapshot.free_memory
+        snapshot.measure()
+        if snapshot.free_memory > previous_free:
+            last_increase = time.monotonic()
+
+
 @contextlib.contextmanager
 def memory_profiling(
     baseline_snapshot: MemorySnapshot,
@@ -295,10 +319,15 @@ def memory_profiling(
 
     yield result
 
+    # Wait for the profile run's kernels before freeing, so empty_cache() can
+    # release their buffers.
+    torch.accelerator.synchronize(baseline_snapshot.device_)
     gc.collect()
     torch.accelerator.empty_cache()
 
     result.after_profile.measure()
+    if current_platform.is_xpu():
+        _wait_for_released_memory(result.after_profile)
 
     diff_profile = result.after_profile - result.before_profile
     diff_from_create = result.after_profile - result.before_create
